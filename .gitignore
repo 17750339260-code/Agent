@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.idea/
+.vscode/
+.continue/
+
+.env
+.env.*
+!.env.example
+
+*.log
+*.tmp
+
+# Large local ASR sample audio. GitHub rejects files larger than 100 MB;
+# use Git LFS or external storage if these need to be versioned.
+test_asr/asr_test_audio/
