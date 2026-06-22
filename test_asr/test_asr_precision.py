@@ -1132,9 +1132,10 @@ def run_precision_suite() -> List[Dict[str, Any]]:
 
 @pytest.mark.asr
 @pytest.mark.performance
-def test_asr_precision_metrics() -> None:
+def test_asr_precision_metrics(capsys: Any) -> None:
     """pytest 入口：运行后所有指标会输出到控制台。"""
-    metrics = run_precision_suite()
+    with capsys.disabled():
+        metrics = run_precision_suite()
     assert metrics, "至少应完成一条 ASR 指标评测"
     failed = [
         item
