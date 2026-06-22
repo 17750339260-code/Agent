@@ -59,7 +59,7 @@ def main():
     parser.add_argument("--background_loop", type=str2bool, default=True)
     parser.add_argument("--text_frontend", type=str2bool, default=True)
     parser.add_argument("--res_content", type=str2bool, default=True)
-    parser.add_argument("--url", type=str, default="http://36.111.82.53:10015/api/tts/instruct2")
+    parser.add_argument("--url", type=str, default="http://36.111.82.53:10014/api/tts/instruct2")
 
     args = parser.parse_args()
 

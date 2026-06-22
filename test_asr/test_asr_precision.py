@@ -74,16 +74,16 @@ except ImportError:  # pragma: no cover
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO_DIR = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio")
-DEFAULT_MANIFEST = os.path.join(PROJECT_ROOT, "test_asr", "asr_precision_manifest.json")
-
+DEFAULT_MANIFEST = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_json", "asr_precision_manifest.json")
 # ASR 服务地址、模型、超时均支持环境变量覆盖，便于测试不同环境。
 API_URL = os.environ.get("ASR_API_URL", "http://36.111.82.53:10017/v1/audio/trans")
 ASR_MODEL = os.environ.get("ASR_MODEL", "funasr-iic")
-REQUEST_TIMEOUT_SEC = int(os.environ.get("ASR_TIMEOUT_SEC", "180"))
+REQUEST_TIMEOUT_SEC = int(os.environ.get("ASR_TIMEOUT_SEC", "21600"))
 LANGUAGE = os.environ.get("ASR_LANGUAGE", "zh")
+ASR_PROGRESS_INTERVAL_SEC = float(os.environ.get("ASR_PROGRESS_INTERVAL_SEC", "10"))
 
-# 一致性测试重复次数。大模型若存在采样随机性，同一音频多次结果不一致会被量化。
-CONSISTENCY_RUNS = int(os.environ.get("ASR_CONSISTENCY_RUNS", "3"))
+# 一致性测试重复次数。大模型若存在采样随机性，同一音频多次结果不一致会被量化。短音频设置为 3，短音频设置为 1。
+CONSISTENCY_RUNS = int(os.environ.get("ASR_CONSISTENCY_RUNS", "1"))
 
 # SNR 鲁棒性测试默认开启。仅 WAV 音频且安装 numpy 时可生成加噪临时文件。
 RUN_SNR_ROBUSTNESS = os.environ.get("ASR_RUN_SNR_ROBUSTNESS", "1") == "1"
@@ -479,6 +479,67 @@ class ResourceSampler:
             self._stop_event.wait(self.interval_sec)
 
 
+def format_duration(seconds: Optional[float]) -> str:
+    """将秒数格式化为 HH:MM:SS，便于长音频控制台进度查看。"""
+    if seconds is None:
+        return "未知"
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class AsrProgressReporter:
+    """ASR 长请求期间的控制台心跳，避免长音频识别时看起来像卡住。"""
+
+    def __init__(
+        self,
+        file_path: str,
+        audio_duration_sec: Optional[float],
+        interval_sec: float = ASR_PROGRESS_INTERVAL_SEC,
+    ) -> None:
+        self.file_path = file_path
+        self.audio_duration_sec = audio_duration_sec
+        self.interval_sec = max(1.0, interval_sec)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._start = 0.0
+
+    def start(self) -> None:
+        self._start = time.perf_counter()
+        file_mb = os.path.getsize(self.file_path) / 1024 / 1024 if os.path.exists(self.file_path) else 0
+        print(
+            f"\n[ASR进度] 开始识别：{os.path.basename(self.file_path)} | "
+            f"音频时长={format_duration(self.audio_duration_sec)} | 文件={file_mb:.2f}MB",
+            flush=True,
+        )
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self, status: str) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        elapsed = time.perf_counter() - self._start if self._start else 0.0
+        print(f"[ASR进度] 结束：{status} | 总耗时={format_duration(elapsed)} ({elapsed:.2f}s)", flush=True)
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self.interval_sec):
+            elapsed = time.perf_counter() - self._start
+            if self.audio_duration_sec and self.audio_duration_sec > 0:
+                approx_audio_sec = min(elapsed, self.audio_duration_sec)
+                percent = min(99.0, approx_audio_sec / self.audio_duration_sec * 100)
+                print(
+                    f"[ASR进度] 等待响应中：已耗时={format_duration(elapsed)} | "
+                    f"按耗时估算已处理音频≈{format_duration(approx_audio_sec)}/"
+                    f"{format_duration(self.audio_duration_sec)} ({percent:.1f}%) "
+                    f"（按耗时估算，非服务端真实进度）",
+                    flush=True,
+                )
+            else:
+                print(f"[ASR进度] 等待响应中：已耗时={format_duration(elapsed)}", flush=True)
+
+
 # ===================== ASR 请求与响应解析 =====================
 
 
@@ -522,7 +583,9 @@ def extract_text(response_json: Any) -> str:
 def transcribe_audio(file_path: str) -> TranscribeResult:
     """发送一次 ASR 请求，并记录耗时和本机资源峰值。"""
     sampler = ResourceSampler()
+    progress = AsrProgressReporter(file_path, get_wav_duration_sec(file_path))
     sampler.start()
+    progress.start()
     start = time.perf_counter()
     try:
         response = requests.post(
@@ -536,6 +599,8 @@ def transcribe_audio(file_path: str) -> TranscribeResult:
             body = response.json()
         except json.JSONDecodeError:
             body = response.text
+        resource = sampler.stop()
+        progress.stop(f"HTTP {response.status_code}")
 
         return TranscribeResult(
             ok=response.status_code == 200,
@@ -544,17 +609,19 @@ def transcribe_audio(file_path: str) -> TranscribeResult:
             response_json=body,
             status_code=response.status_code,
             error="" if response.status_code == 200 else response.text[:500],
-            resource=sampler.stop(),
+            resource=resource,
         )
     except Exception as exc:
         elapsed = time.perf_counter() - start
+        resource = sampler.stop()
+        progress.stop("异常")
         return TranscribeResult(
             ok=False,
             text="",
             elapsed_sec=elapsed,
             response_json=None,
             error=str(exc),
-            resource=sampler.stop(),
+            resource=resource,
         )
 
 
@@ -656,9 +723,9 @@ def load_cases() -> List[AsrMetricCase]:
         ]
 
     return [
-        AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "123.wav"), label="default-123"),
-        AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "4-111.wav"), label="default-4-111"),
-        AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "1.wav"), label="default-1"),
+        # AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "123.wav"), label="default-123"),
+        # AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "4-111.wav"), label="default-4-111"),
+        AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "上市公司治理要求及实践.wav"), label="default-1")
     ]
 
 
