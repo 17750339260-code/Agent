@@ -27,11 +27,12 @@ from typing import Any, Optional
 
 APP_KEY = os.getenv("APP_KEY", "1001300033")
 SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
+# URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
 URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
-# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
 COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100565")
 MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
-
+# MODEL = os.getenv("MODEL", "Qwen3-VL")  #公司环境
+DEFAULT_CONCURRENCY_LEVELS = [20,22,24,26,28,30,32,34,36,38,40]
 DEFAULT_SYSTEM_PROMPT = "你是一个严谨的测试助手，请根据用户要求给出清晰、可验证的回答。"
 DEFAULT_USER_PROMPT = """
 # 角色定义
@@ -194,6 +195,7 @@ DEFAULT_USER_PROMPT = """
 class RequestResult:
     concurrency: int
     request_id: int
+    burst_id: int
     success: bool
     status_code: Optional[int]
     error: str
@@ -214,6 +216,7 @@ class RequestResult:
 @dataclass
 class StepResult:
     concurrency: int
+    burst_rounds: int
     attempted_requests: int
     completed_requests: int
     success_count: int
@@ -224,6 +227,7 @@ class StepResult:
     total_qps: float
     configured_concurrency: int
     observed_peak_inflight: int
+    full_concurrency_bursts: int
     avg_response_ms: Optional[float]
     p50_response_ms: Optional[float]
     p90_response_ms: Optional[float]
@@ -483,6 +487,14 @@ class InflightCounter:
             self.current -= 1
 
 
+class PeakTracker:
+    def __init__(self) -> None:
+        self.peak = 0
+
+    def observe(self, value: int) -> None:
+        self.peak = max(self.peak, value)
+
+
 class StartGate:
     def __init__(self, target_ready: int) -> None:
         self.target_ready = target_ready
@@ -496,14 +508,15 @@ class StartGate:
             self.condition.notify_all()
         self.event.wait()
 
-    def wait_until_ready(self, timeout: float = 30.0) -> None:
+    def wait_until_ready(self, timeout: float = 30.0) -> bool:
         deadline = time.perf_counter() + timeout
         with self.condition:
             while self.ready < self.target_ready:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
-                    break
+                    return False
                 self.condition.wait(remaining)
+            return True
 
     def release(self) -> None:
         self.event.set()
@@ -519,14 +532,13 @@ class GatewayConcurrentTester:
         self,
         request_id: int,
         concurrency: int,
+        burst_id: int,
         start_gate: StartGate,
         inflight: InflightCounter,
     ) -> RequestResult:
-        start_gate.ready_and_wait()
-
-        inflight.enter()
-        start_epoch = time.time()
-        start_perf = time.perf_counter()
+        start_epoch = 0.0
+        start_perf = 0.0
+        entered_inflight = False
         status_code: Optional[int] = None
         header_ms: Optional[float] = None
         first_byte_ms: Optional[float] = None
@@ -537,13 +549,18 @@ class GatewayConcurrentTester:
         usage_source: Any = None
 
         try:
-            body = json.dumps(self.payload, ensure_ascii=False).encode("utf-8")
             request = urllib.request.Request(
                 self.args.url,
-                data=body,
+                data=json.dumps(self.payload, ensure_ascii=False).encode("utf-8"),
                 headers=make_headers(self.args.app_key, self.args.secret_key),
                 method="POST",
             )
+            start_gate.ready_and_wait()
+
+            inflight.enter()
+            entered_inflight = True
+            start_epoch = time.time()
+            start_perf = time.perf_counter()
 
             try:
                 response = urllib.request.urlopen(
@@ -565,6 +582,7 @@ class GatewayConcurrentTester:
                         start_perf,
                         error_message,
                         status_code,
+                        burst_id,
                     )
                 finally:
                     exc.close()
@@ -600,15 +618,27 @@ class GatewayConcurrentTester:
                     start_perf,
                     error,
                     status_code,
+                    burst_id,
                 )
 
             prompt_tokens, completion_tokens, total_tokens = extract_usage(usage_source)
+            output_text = "".join(output_parts).strip()
+            success = 200 <= (status_code or 0) < 300
+            error = "" if success else f"HTTP {status_code}"
+            if success and not output_text:
+                success = False
+                error = "Empty output"
+            if success and self.args.stream and stream_events <= 0:
+                success = False
+                error = "No stream events"
+
             return RequestResult(
                 concurrency=concurrency,
                 request_id=request_id,
-                success=200 <= (status_code or 0) < 300,
+                burst_id=burst_id,
+                success=success,
                 status_code=status_code,
-                error="" if 200 <= (status_code or 0) < 300 else f"HTTP {status_code}",
+                error=error,
                 start_epoch=start_epoch,
                 end_epoch=end_epoch,
                 total_ms=(end_perf - start_perf) * 1000,
@@ -617,21 +647,22 @@ class GatewayConcurrentTester:
                 first_token_ms=first_token_ms,
                 response_bytes=response_bytes,
                 stream_events=stream_events,
-                output_chars=len("".join(output_parts)),
+                output_chars=len(output_text),
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
             )
         except (TimeoutError, socket.timeout) as exc:
-            return self._failure(concurrency, request_id, start_epoch, start_perf, f"Timeout: {exc}", status_code)
+            return self._failure(concurrency, request_id, start_epoch, start_perf, f"Timeout: {exc}", status_code, burst_id)
         except urllib.error.URLError as exc:
             if is_timeout_error(exc):
-                return self._failure(concurrency, request_id, start_epoch, start_perf, f"Timeout: {exc}", status_code)
-            return self._failure(concurrency, request_id, start_epoch, start_perf, f"Connection error: {exc}", status_code)
+                return self._failure(concurrency, request_id, start_epoch, start_perf, f"Timeout: {exc}", status_code, burst_id)
+            return self._failure(concurrency, request_id, start_epoch, start_perf, f"Connection error: {exc}", status_code, burst_id)
         except Exception as exc:
-            return self._failure(concurrency, request_id, start_epoch, start_perf, f"Exception: {exc}", status_code)
+            return self._failure(concurrency, request_id, start_epoch, start_perf, f"Exception: {exc}", status_code, burst_id)
         finally:
-            inflight.leave()
+            if entered_inflight:
+                inflight.leave()
 
     def _read_body(self, response: Any, start_perf: float) -> tuple[bytes, int, Optional[float]]:
         chunks: list[bytes] = []
@@ -710,48 +741,83 @@ class GatewayConcurrentTester:
         start_perf: float,
         error: str,
         status_code: Optional[int],
+        burst_id: int,
     ) -> RequestResult:
         end_perf = time.perf_counter()
+        started = start_perf > 0
         return RequestResult(
             concurrency=concurrency,
             request_id=request_id,
+            burst_id=burst_id,
             success=False,
             status_code=status_code,
             error=error[:300],
-            start_epoch=start_epoch,
+            start_epoch=start_epoch if started else time.time(),
             end_epoch=time.time(),
-            total_ms=(end_perf - start_perf) * 1000,
+            total_ms=(end_perf - start_perf) * 1000 if started else 0.0,
         )
 
     def run_step(self, concurrency: int, total_requests: int) -> tuple[StepResult, list[RequestResult]]:
-        actual_first_wave = min(concurrency, total_requests)
-        start_gate = StartGate(actual_first_wave)
-        inflight = InflightCounter()
         results: list[RequestResult] = []
         completed = 0
         progress_every = max(1, total_requests // 10)
+        burst_count = (total_requests + concurrency - 1) // concurrency
+        peak_tracker = PeakTracker()
 
         print(f"\n{'=' * 72}")
-        print(f"开始测试并发 {concurrency}: 请求数={total_requests}, stream={self.args.stream}")
+        print(
+            f"开始测试并发 {concurrency}: 请求数={total_requests}, "
+            f"同步批次={burst_count}, stream={self.args.stream}"
+        )
         print(f"{'=' * 72}")
+        start = time.perf_counter()
+        next_request_id = 1
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [
-                executor.submit(self.send_request, request_id, concurrency, start_gate, inflight)
-                for request_id in range(1, total_requests + 1)
-            ]
-            start_gate.wait_until_ready()
-            start = time.perf_counter()
-            start_gate.release()
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                results.append(result)
-                completed += 1
-                if completed % progress_every == 0 or completed == total_requests:
-                    ok_count = sum(1 for item in results if item.success)
-                    print(f"进度: {completed}/{total_requests}, 当前成功率={ok_count / completed * 100:.2f}%")
+            for burst_id in range(1, burst_count + 1):
+                burst_size = min(concurrency, total_requests - completed)
+                start_gate = StartGate(burst_size)
+                inflight = InflightCounter()
+                futures = [
+                    executor.submit(
+                        self.send_request,
+                        request_id,
+                        concurrency,
+                        burst_id,
+                        start_gate,
+                        inflight,
+                    )
+                    for request_id in range(next_request_id, next_request_id + burst_size)
+                ]
+                next_request_id += burst_size
+
+                if not start_gate.wait_until_ready(timeout=self.args.start_timeout):
+                    start_gate.release()
+                    raise RuntimeError(
+                        f"并发 {concurrency} 第 {burst_id} 批启动超时: "
+                        f"仅 {start_gate.ready}/{burst_size} 个 worker 就绪"
+                    )
+
+                burst_start = time.perf_counter()
+                print(f"第 {burst_id}/{burst_count} 批释放: {burst_size} 个请求同时发起")
+                start_gate.release()
+
+                for future in concurrent.futures.as_completed(futures):
+                    result = future.result()
+                    results.append(result)
+                    completed += 1
+                    if completed % progress_every == 0 or completed == total_requests:
+                        ok_count = sum(1 for item in results if item.success)
+                        print(f"进度: {completed}/{total_requests}, 当前成功率={ok_count / completed * 100:.2f}%")
+
+                peak_tracker.observe(inflight.peak)
+                if burst_id != burst_count and self.args.burst_interval > 0:
+                    elapsed = time.perf_counter() - burst_start
+                    sleep_seconds = max(self.args.burst_interval - elapsed, 0.0)
+                    if sleep_seconds > 0:
+                        time.sleep(sleep_seconds)
 
         duration = time.perf_counter() - start
-        step = summarize_step(concurrency, total_requests, duration, inflight.peak, results)
+        step = summarize_step(concurrency, total_requests, duration, peak_tracker.peak, burst_count, results)
         print_step_report(step)
         return step, sorted(results, key=lambda item: item.request_id)
 
@@ -761,6 +827,7 @@ def summarize_step(
     total_requests: int,
     duration: float,
     observed_peak: int,
+    burst_rounds: int,
     results: list[RequestResult],
 ) -> StepResult:
     success = [item for item in results if item.success]
@@ -774,9 +841,11 @@ def summarize_step(
     total_completion_tokens = sum(completion_tokens)
     token_coverage = (len(completion_tokens) / len(success) * 100) if success else 0.0
     error_summary = Counter(normalize_error(item.error) for item in failed)
+    burst_sizes = Counter(item.burst_id for item in results)
 
     return StepResult(
         concurrency=concurrency,
+        burst_rounds=burst_rounds,
         attempted_requests=total_requests,
         completed_requests=len(results),
         success_count=len(success),
@@ -787,6 +856,10 @@ def summarize_step(
         total_qps=(len(results) / duration) if duration > 0 else 0.0,
         configured_concurrency=concurrency,
         observed_peak_inflight=observed_peak,
+        full_concurrency_bursts=sum(
+            1 for burst_id in range(1, burst_rounds + 1)
+            if burst_sizes[burst_id] >= concurrency
+        ),
         avg_response_ms=average(response_times),
         p50_response_ms=percentile(response_times, 50),
         p90_response_ms=percentile(response_times, 90),
@@ -818,6 +891,10 @@ def print_step_report(step: StepResult) -> None:
     print(f"计划请求数: {step.attempted_requests}")
     print(f"完成请求数: {step.completed_requests}")
     print(f"成功/失败: {step.success_count}/{step.failed_count} ({step.success_rate:.2f}%)")
+    print(
+        f"同步批次: {step.burst_rounds}, "
+        f"满并发批次: {step.full_concurrency_bursts}/{step.burst_rounds}"
+    )
     print(f"目标并发/实际峰值并发: {step.configured_concurrency}/{step.observed_peak_inflight}")
     print(f"总耗时: {step.total_duration_s:.2f}s")
     print(f"总QPS/成功QPS: {step.total_qps:.2f}/{step.success_qps:.2f}")
@@ -875,8 +952,8 @@ def build_final_report(
         level_text = f"指定并发: {args.concurrent}"
         effective_break_confirmations = 1
     else:
-        level_text = f"{args.start_concurrent} -> {args.max_concurrent}, step={args.step}"
-        effective_break_confirmations = 1 if args.start_concurrent == args.max_concurrent else args.break_confirmations
+        level_text = ", ".join(str(step.concurrency) for step in steps)
+        effective_break_confirmations = 1 if len(steps) == 1 else args.break_confirmations
     healthy_steps = [
         step for step in steps if step.success_rate >= args.success_threshold
     ]
@@ -902,7 +979,7 @@ def build_final_report(
         f"- 模型: {args.model}",
         f"- componentCode: {args.component_code}",
         f"- stream: {args.stream}",
-        f"- 每阶请求数: {args.total}",
+        f"- 请求计划: {format_request_plan(args)}",
         f"- 并发级别: {level_text}",
         f"- 成功率阈值: {args.success_threshold:.2f}%",
         f"- P95增长拐点阈值: {args.latency_growth_threshold:.2f}倍",
@@ -925,8 +1002,8 @@ def build_final_report(
         )
     lines.extend(
         [
-            "- 口径说明: 响应耗时为客户端端到端耗时，包含每次请求的 JSON 序列化、HMAC 头生成、"
-            "Request 对象创建、网络传输和响应读取；不包含脚本启动阶段的 payload 准备和图片 Base64 编码。",
+            "- 口径说明: 每个同步批次会先创建好请求对象并等待全部 worker 就绪，再统一释放发起网络请求；"
+            "响应耗时从释放后开始统计，包含网络传输、服务端处理和响应读取。",
             "- TTFB 为响应体首字节耗时；TTFT 仅在 stream=True 且首次出现有效文本增量时统计；"
             "token 吞吐只基于接口返回 usage 的请求统计，并用 usage 覆盖率说明可信度。",
             f"- 拐点确认: 本次按连续 {effective_break_confirmations} 个阶梯触发风险条件确认拐点；"
@@ -934,13 +1011,14 @@ def build_final_report(
             "",
             "## 阶梯结果",
             "",
-            "| 并发 | 实际峰值 | 请求数 | 成功率 | 成功QPS | P95响应 | P99响应 | P95 TTFB | P95 TTFT | token吞吐 | usage覆盖率 |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 并发 | 同步批次 | 满并发批次 | 实际峰值 | 请求数 | 成功率 | 成功QPS | P95响应 | P99响应 | P95 TTFB | P95 TTFT | token吞吐 | usage覆盖率 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for step in steps:
         lines.append(
-            f"| {step.concurrency} | {step.observed_peak_inflight} | {step.attempted_requests} | "
+            f"| {step.concurrency} | {step.burst_rounds} | "
+            f"{step.full_concurrency_bursts} | {step.observed_peak_inflight} | {step.attempted_requests} | "
             f"{step.success_rate:.2f}% | {step.success_qps:.2f} | {format_ms(step.p95_response_ms)} | "
             f"{format_ms(step.p99_response_ms)} | {format_ms(step.p95_ttfb_ms)} | "
             f"{format_ms(step.p95_ttft_ms)} | {format_number(step.output_token_throughput, ' tok/s')} | "
@@ -951,6 +1029,12 @@ def build_final_report(
     for name, path in report_files.items():
         lines.append(f"- {name}: {path}")
     return "\n".join(lines)
+
+
+def format_request_plan(args: argparse.Namespace) -> str:
+    if args.total is None:
+        return f"每档按 并发数 x {args.rounds} 轮 自动计算"
+    return "每档至少 {0} 个请求；不足满批次时自动补齐到当前并发整数倍".format(args.total)
 
 
 def write_reports(
@@ -1006,9 +1090,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--verify-ssl", action="store_true", help="默认不校验证书；传入该参数后启用证书校验")
     parser.add_argument("--concurrent", type=int, default=None, help="只测试一个指定并发；不传则执行阶梯并发")
-    parser.add_argument("--total", type=int, default=20, help="每个并发级别的请求总数，建议不小于最大并发")
+    parser.add_argument("--total", type=int, default=None, help="每个并发级别的最少请求总数；会自动补齐为当前并发的整数倍")
+    parser.add_argument("--rounds", type=int, default=5, help="未指定 --total 时，每个并发级别执行多少轮同步 burst")
+    parser.add_argument("--burst-interval", type=float, default=0.0, help="同一阶梯内两轮同步 burst 的最小间隔秒数")
+    parser.add_argument("--start-timeout", type=float, default=30.0, help="等待一轮内所有 worker 就绪的超时时间")
     parser.add_argument("--start-concurrent", type=int, default=1)
-    parser.add_argument("--max-concurrent", type=int, default=20)
+    parser.add_argument("--max-concurrent", type=int, default=40)
     parser.add_argument("--step", type=int, default=1)
     parser.add_argument("--success-threshold", type=float, default=95.0, help="判定稳定并发的成功率阈值")
     parser.add_argument("--latency-growth-threshold", type=float, default=2.0, help="相邻阶梯 P95 增长倍数达到该值视为拐点")
@@ -1022,8 +1109,14 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.concurrent is not None and args.concurrent <= 0:
         raise ValueError("--concurrent 必须大于 0")
-    if args.total <= 0:
+    if args.total is not None and args.total <= 0:
         raise ValueError("--total 必须大于 0")
+    if args.rounds <= 0:
+        raise ValueError("--rounds 必须大于 0")
+    if args.burst_interval < 0:
+        raise ValueError("--burst-interval 不能小于 0")
+    if args.start_timeout <= 0:
+        raise ValueError("--start-timeout 必须大于 0")
     if args.start_concurrent <= 0 or args.max_concurrent <= 0 or args.step <= 0:
         raise ValueError("--start-concurrent、--max-concurrent、--step 必须大于 0")
     if args.start_concurrent > args.max_concurrent:
@@ -1049,6 +1142,24 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"--{option_name.replace('_', '-')} 指定的文件不存在: {value[1:]}")
 
 
+def has_custom_concurrency_range(argv: list[str]) -> bool:
+    range_options = ("--start-concurrent", "--max-concurrent", "--step")
+    return any(
+        arg == option or arg.startswith(f"{option}=")
+        for arg in argv[1:]
+        for option in range_options
+    )
+
+
+def resolve_total_requests(args: argparse.Namespace, concurrency: int) -> int:
+    requested = concurrency * args.rounds if args.total is None else args.total
+    requested = max(requested, concurrency)
+    remainder = requested % concurrency
+    if remainder:
+        requested += concurrency - remainder
+    return requested
+
+
 def main() -> int:
     args = parse_args()
     try:
@@ -1064,16 +1175,16 @@ def main() -> int:
 
     if args.concurrent:
         levels = [args.concurrent]
-    else:
+    elif has_custom_concurrency_range(sys.argv):
         levels = list(range(args.start_concurrent, args.max_concurrent + 1, args.step))
+    else:
+        levels = DEFAULT_CONCURRENCY_LEVELS
 
     print("\nQwen3-VL-32B-Instruct 阶梯并发测试")
     print(f"目标URL: {args.url}")
     print(f"并发级别: {levels}")
-    print(f"每阶请求数: {args.total}")
+    print(f"请求计划: {format_request_plan(args)}")
     print(f"SSL证书校验: {args.verify_ssl}")
-    if args.total < max(levels):
-        print("提示: --total 小于最大并发，最高实际峰值并发会受请求总数限制。")
 
     all_steps: list[StepResult] = []
     all_details: list[RequestResult] = []
@@ -1084,7 +1195,13 @@ def main() -> int:
     required_break_confirmations = 1 if len(levels) == 1 else args.break_confirmations
 
     for level in levels:
-        step, details = tester.run_step(level, args.total)
+        total_requests = resolve_total_requests(args, level)
+        if args.total is not None and total_requests != args.total:
+            print(
+                f"\n提示: 并发 {level} 的 --total={args.total} 不是并发整数倍，"
+                f"已补齐为 {total_requests}，确保每轮都是满并发同步发起。"
+            )
+        step, details = tester.run_step(level, total_requests)
         all_steps.append(step)
         all_details.extend(details)
 
