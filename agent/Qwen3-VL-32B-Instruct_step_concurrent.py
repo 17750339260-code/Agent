@@ -27,10 +27,10 @@ from typing import Any, Optional
 
 APP_KEY = os.getenv("APP_KEY", "1001300033")
 SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
-URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
+URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
 # URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
 COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100565")
-MODEL = os.getenv("MODEL", "Qwen3-VL")
+MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
 
 DEFAULT_SYSTEM_PROMPT = "你是一个严谨的测试助手，请根据用户要求给出清晰、可验证的回答。"
 DEFAULT_USER_PROMPT = """

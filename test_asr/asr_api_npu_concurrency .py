@@ -15,7 +15,7 @@ FunASR 语音识别服务 — ASR 压力测试全集
   QPS    = 每秒请求数（Queries Per Second）
   RTF    = 推理耗时 ÷ 音频时长；<1 表示比实时更快
   TTFB   = 收到 HTTP 响应头的时间（本接口非流式，通常≈总延迟）
-  CER    = 字错误率（需 --reference-text 参考文本）
+  CER    = 字错误率（默认读取参考文本文件）
   WER    = 词错误率
   并发   = 同时有多少个“工人”在发请求
 
@@ -37,7 +37,8 @@ FunASR 语音识别服务 — ASR 压力测试全集
 用法 (请用 python 直接运行):
   python "test_asr/asr_api_npu_concurrency .py"
   python "test_asr/asr_api_npu_concurrency .py" --tests baseline,ramp
-  python "test_asr/asr_api_npu_concurrency .py" --tests all --reference-text "参考文本"
+  python "test_asr/asr_api_npu_concurrency .py" --tests all
+  # 默认读取 test_asr/asr_test_json/asr_reference_text.txt 作为 CER/WER 参考文本
 """
 
 from __future__ import annotations
@@ -47,18 +48,27 @@ import argparse      # 解析命令行参数，如 --url --tests
 import asyncio       # 异步并发，同时发很多 HTTP 请求
 import base64        # 把 wav 二进制转成接口需要的 base64 字符串
 import json          # 保存压测报告为 JSON
+import math          # 固定 QPS 计划请求数计算
 import os            # 路径、读文件
+import re            # 文本归一化和中文数字处理
 import ssl           # HTTPS 证书设置
 import statistics    # 求平均数等
 import sys           # 退出程序 sys.exit
 import time          # 计时
+import unicodedata   # 全角/半角归一化、标点分类
 import wave          # 读取 wav 头信息（采样率、时长）
+from collections import Counter
 from dataclasses import asdict, dataclass, field  # 数据类，少写样板代码
 from datetime import datetime
 from enum import Enum
 from typing import Any, Optional  # 类型标注，方便阅读
 
 import aiohttp         # 异步 HTTP 客户端，用来调 ASR 接口
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # jiwer：可选库，用于精确计算 CER/WER；没装则用简化算法
 try:
@@ -73,6 +83,9 @@ except ImportError:
 DEFAULT_API_URL = "http://36.111.82.53:10017/v1/audio/trans"  # ASR 服务地址
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根目录
 DEFAULT_AUDIO = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "1.wav")  # 默认测试音频
+DEFAULT_REFERENCE_TEXT = os.path.join(
+    PROJECT_ROOT, "test_asr", "asr_test_json", "asr_reference_text.txt"
+)  # 默认参考文本，用于计算 CER/WER
 
 # HTTPS 时跳过证书校验（内网/自签证书场景）
 SSL_CTX = ssl.create_default_context()
@@ -133,6 +146,9 @@ class AudioMeta:
 class RequestResult:
     """单次 ASR 请求的结果（发一次请求就产生一条）"""
     success: bool = False           # HTTP 200 且解析到结果
+    start_ts: float = 0.0           # perf_counter 起始时间，用于按真实时间分桶
+    end_ts: float = 0.0             # perf_counter 完成时间，用于按真实时间分桶
+    http_status: Optional[int] = None
     latency_sec: float = 0.0        # 从发请求到收完响应的总耗时
     ttfb_sec: float = 0.0           # 首字节时间（收到响应头）
     body_read_sec: float = 0.0        # 读响应体耗时 ≈ latency - ttfb
@@ -159,12 +175,15 @@ class AsrAggMetrics:
     p50_rtf: float = 0.0
     p95_rtf: float = 0.0
     max_rtf: float = 0.0            # 最慢的一条 RTF
-    avg_chars_per_sec: float = 0.0  # 平均识别速度（字/秒）
+    avg_chars_per_sec: float = 0.0  # 请求内文本产出速率：总字数 / 总请求耗时
+    text_throughput_cps: float = 0.0  # 系统文本吞吐：总字数 / 墙钟时间
+    audio_chars_per_sec: float = 0.0  # 音频内容语速：总字数 / 总音频时长
     avg_text_chars: float = 0.0     # 平均每条返回多少字
     empty_text_rate: float = 0.0    # 返回空文本的比例（%）
     avg_cer: Optional[float] = None
     p95_cer: Optional[float] = None
     avg_wer: Optional[float] = None
+    p95_wer: Optional[float] = None
     audio_throughput_x: float = 0.0  # 成功处理的「音频秒数」÷ 墙钟秒数
     realtime_ratio: float = 0.0      # RTF<1 的请求占比（%）
 
@@ -270,6 +289,41 @@ def load_audio_meta(audio_path: str) -> AudioMeta:
     )
 
 
+def load_reference_text(reference_file: Optional[str], inline_text: Optional[str]) -> Optional[str]:
+    """
+    读取 CER/WER 参考文本。
+    inline_text 保留向后兼容；日常使用推荐维护 reference_file，无需在命令行传长文本。
+    """
+    if inline_text and inline_text.strip():
+        return inline_text.strip()
+
+    if not reference_file:
+        return None
+
+    path = reference_file if os.path.isabs(reference_file) else os.path.join(PROJECT_ROOT, reference_file)
+    if not os.path.exists(path):
+        print(f"  ⚠️ 参考文本文件不存在，CER/WER 将显示 N/A: {path}")
+        return None
+
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read().strip()
+
+    if not text:
+        print(f"  ⚠️ 参考文本文件为空，CER/WER 将显示 N/A: {path}")
+        return None
+
+    return text
+
+
+def resolve_reference_source(reference_file: Optional[str], inline_text: Optional[str]) -> str:
+    """返回当前参考文本来源，用于启动日志和 JSON 报告。"""
+    if inline_text and inline_text.strip():
+        return "命令行 --reference-text"
+    if reference_file:
+        return reference_file if os.path.isabs(reference_file) else os.path.join(PROJECT_ROOT, reference_file)
+    return ""
+
+
 def build_payload(b64_data: str, model: str = "funasr-iic", hotwords: str = "") -> dict:
     """构造 POST 请求的 JSON  body，与 FunASR 接口约定一致"""
     return {
@@ -298,31 +352,140 @@ def extract_text(body: Any) -> str:
     return ""
 
 
+_CHINESE_DATE_NUM_RE = re.compile(r"([零〇一二三四五六七八九两十]{1,8})(?=[年月日号])")
+
+
+def _chinese_date_number_to_arabic(text: str) -> str:
+    """把二零二五年、十月这类日期数字归一成 2025年、10月，减少 ITN 差异对 CER/WER 的污染。"""
+    digit_map = {
+        "零": "0", "〇": "0", "一": "1", "二": "2", "两": "2", "三": "3", "四": "4",
+        "五": "5", "六": "6", "七": "7", "八": "8", "九": "9",
+    }
+
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        if token == "十":
+            return "10"
+        if "十" in token and len(token) <= 3:
+            left, _, right = token.partition("十")
+            tens = int(digit_map.get(left, "1")) if left else 1
+            ones = int(digit_map.get(right, "0")) if right else 0
+            return str(tens * 10 + ones)
+        if all(ch in digit_map for ch in token):
+            return "".join(digit_map[ch] for ch in token)
+        return token
+
+    return _CHINESE_DATE_NUM_RE.sub(repl, text)
+
+
+def normalize_asr_text(text: str, *, keep_spaces: bool = False) -> str:
+    """
+    ASR 准确率前处理：
+    - NFKC 统一全角/半角，英文转小写；
+    - 去掉标点、符号和多余空白；
+    - 日期场景下把中文数字归一为阿拉伯数字。
+    """
+    text = _chinese_date_number_to_arabic(unicodedata.normalize("NFKC", text or "").lower())
+    out: list[str] = []
+    last_space = False
+    for ch in text:
+        if ch.isspace():
+            if keep_spaces and out and not last_space:
+                out.append(" ")
+                last_space = True
+            continue
+        cat = unicodedata.category(ch)
+        if cat.startswith("P") or cat.startswith("S"):
+            continue
+        out.append(ch)
+        last_space = False
+    return "".join(out).strip()
+
+
+def _is_cjk_char(ch: str) -> bool:
+    code = ord(ch)
+    return (
+        0x4E00 <= code <= 0x9FFF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x20000 <= code <= 0x2A6DF
+        or 0x2A700 <= code <= 0x2B73F
+        or 0x2B740 <= code <= 0x2B81F
+        or 0x2B820 <= code <= 0x2CEAF
+    )
+
+
+def tokenize_for_wer(text: str) -> list[str]:
+    """
+    中文 ASR 没有天然空格分词。这里按中文单字、连续英文/数字词元切分，
+    避免整段中文被 split() 当成一个词而导致 WER 经常显示 100%。
+    """
+    normalized = normalize_asr_text(text, keep_spaces=True)
+    tokens: list[str] = []
+    buf: list[str] = []
+
+    def flush() -> None:
+        if buf:
+            tokens.append("".join(buf))
+            buf.clear()
+
+    for ch in normalized:
+        if ch.isspace():
+            flush()
+        elif _is_cjk_char(ch):
+            flush()
+            tokens.append(ch)
+        elif ch.isalnum():
+            buf.append(ch)
+        else:
+            flush()
+    flush()
+    return tokens
+
+
+def edit_distance(ref: list[str] | str, hyp: list[str] | str) -> int:
+    """标准 Levenshtein 编辑距离，用于 CER/WER。"""
+    if len(ref) < len(hyp):
+        ref, hyp = hyp, ref
+    previous = list(range(len(hyp) + 1))
+    for i, r_item in enumerate(ref, 1):
+        current = [i]
+        for j, h_item in enumerate(hyp, 1):
+            insert_cost = current[j - 1] + 1
+            delete_cost = previous[j] + 1
+            replace_cost = previous[j - 1] + (0 if r_item == h_item else 1)
+            current.append(min(insert_cost, delete_cost, replace_cost))
+        previous = current
+    return previous[-1]
+
+
 def calc_cer(reference: str, hypothesis: str) -> Optional[float]:
     """字错误率 Character Error Rate：0 表示完全一致，越大越差"""
-    if not reference or not hypothesis:
+    if not reference:
         return None
-    if jiwer_cer is not None:
-        return float(jiwer_cer(reference, hypothesis))
-    ref, hyp = reference.replace(" ", ""), hypothesis.replace(" ", "")
+    ref = normalize_asr_text(reference, keep_spaces=False)
+    hyp = normalize_asr_text(hypothesis, keep_spaces=False)
     if not ref:
         return None
-    matches = sum(1 for a, b in zip(ref, hyp) if a == b)
-    return 1.0 - matches / max(len(ref), len(hyp))
+    if not hyp:
+        return 1.0
+    if jiwer_cer is not None:
+        return float(jiwer_cer(ref, hyp))
+    return edit_distance(ref, hyp) / len(ref)
 
 
 def calc_wer(reference: str, hypothesis: str) -> Optional[float]:
-    """词错误率 Word Error Rate：按空格分词后比较"""
-    if not reference or not hypothesis:
+    """词错误率 Word Error Rate：中文按单字、英文/数字按连续词元计算。"""
+    if not reference:
         return None
-    if jiwer_wer is not None:
-        return float(jiwer_wer(reference, hypothesis))
-    ref_words = reference.split()
-    hyp_words = hypothesis.split()
+    ref_words = tokenize_for_wer(reference)
+    hyp_words = tokenize_for_wer(hypothesis)
     if not ref_words:
         return None
-    matches = sum(1 for a, b in zip(ref_words, hyp_words) if a == b)
-    return 1.0 - matches / max(len(ref_words), len(hyp_words))
+    if not hyp_words:
+        return 1.0
+    if jiwer_wer is not None:
+        return float(jiwer_wer(" ".join(ref_words), " ".join(hyp_words)))
+    return edit_distance(ref_words, hyp_words) / len(ref_words)
 
 
 def percentile(values: list[float], p: float) -> float:
@@ -350,13 +513,14 @@ def aggregate_asr(
     latencies = [r.latency_sec for r in successes]
     ttfbs = [r.ttfb_sec for r in successes]
     rtfs = [r.rtf for r in successes if r.rtf > 0]
-    cps = [r.chars_per_sec for r in successes if r.chars_per_sec > 0]
     chars = [r.text_chars for r in successes]
     cers = [r.cer for r in successes if r.cer is not None]
     wers = [r.wer for r in successes if r.wer is not None]
     empty_count = sum(1 for r in successes if r.text_chars == 0)
 
     total_audio_sec = audio_duration * len(successes)
+    total_latency_sec = sum(latencies)
+    total_text_chars = sum(chars)
     audio_tp = total_audio_sec / wall_sec if wall_sec > 0 else 0.0
     realtime_ratio = (sum(1 for r in rtfs if r < 1.0) / len(rtfs) * 100) if rtfs else 0.0
 
@@ -371,12 +535,15 @@ def aggregate_asr(
         p50_rtf=percentile(rtfs, 50) if rtfs else 0.0,
         p95_rtf=percentile(rtfs, 95) if rtfs else 0.0,
         max_rtf=max(rtfs) if rtfs else 0.0,
-        avg_chars_per_sec=statistics.mean(cps) if cps else 0.0,
+        avg_chars_per_sec=total_text_chars / total_latency_sec if total_latency_sec > 0 else 0.0,
+        text_throughput_cps=total_text_chars / wall_sec if wall_sec > 0 else 0.0,
+        audio_chars_per_sec=total_text_chars / total_audio_sec if total_audio_sec > 0 else 0.0,
         avg_text_chars=statistics.mean(chars) if chars else 0.0,
         empty_text_rate=empty_count / len(successes) * 100,
         avg_cer=statistics.mean(cers) if cers else None,
         p95_cer=percentile(cers, 95) if cers else None,
         avg_wer=statistics.mean(wers) if wers else None,
+        p95_wer=percentile(wers, 95) if wers else None,
         audio_throughput_x=audio_tp,
         realtime_ratio=realtime_ratio,
     )
@@ -466,11 +633,12 @@ def print_asr_metrics(a: AsrAggMetrics, audio: AudioMeta, *, sample_text: str = 
     print(f"  │ RTF:          平均 {a.avg_rtf:.3f}x ({realtime_tag}) | P50 {a.p50_rtf:.3f}x | "
           f"P95 {a.p95_rtf:.3f}x | 最大 {a.max_rtf:.3f}x")
     print(f"  │ 实时占比:     {a.realtime_ratio:.1f}% 请求 RTF<1")
-    print(f"  │ 识别速度:     {a.avg_chars_per_sec:.1f} 字/秒 | 平均 {a.avg_text_chars:.0f} 字/条")
+    print(f"  │ 文本吞吐:     {a.text_throughput_cps:.1f} 字/墙钟秒 | 请求内 {a.avg_chars_per_sec:.1f} 字/请求秒")
+    print(f"  │ 音频语速:     {a.audio_chars_per_sec:.1f} 字/音频秒 | 平均 {a.avg_text_chars:.0f} 字/条")
     print(f"  │ 空结果率:     {a.empty_text_rate:.2f}%")
     print(f"  │ 音频吞吐:     {a.audio_throughput_x:.3f}x (成功音频秒/墙钟秒)")
     print(f"  │ CER:          平均 {_fmt_pct_opt(a.avg_cer)} | P95 {_fmt_pct_opt(a.p95_cer)}")
-    print(f"  │ WER:          平均 {_fmt_pct_opt(a.avg_wer)}")
+    print(f"  │ WER:          平均 {_fmt_pct_opt(a.avg_wer)} | P95 {_fmt_pct_opt(a.p95_wer)}")
     if sample_text:
         preview = sample_text[:70] + ("…" if len(sample_text) > 70 else "")
         print(f"  │ 识别样例:     {preview}")
@@ -506,6 +674,7 @@ async def send_one_request(
     """
     result = RequestResult()
     start = time.perf_counter()  # 高精度计时
+    result.start_ts = start
 
     try:
         async with session.post(
@@ -514,12 +683,13 @@ async def send_one_request(
             ssl=SSL_CTX if ctx.use_ssl else False,
             timeout=aiohttp.ClientTimeout(total=ctx.timeout_s),
         ) as resp:
+            result.http_status = resp.status
             # 进入 async with 且拿到 resp 时，响应头已到 → 记 TTFB
             ttfb = time.perf_counter() - start
             result.ttfb_sec = ttfb
 
             if resp.status == 200:
-                body = await resp.json()
+                body = await resp.json(content_type=None)
                 result.success = True
                 result.text = extract_text(body)
                 result.text_chars = len(result.text)
@@ -540,11 +710,15 @@ async def send_one_request(
     except aiohttp.ClientError as e:
         result.error = str(e)[:120]
         result.error_type = "ConnError"
+    except (json.JSONDecodeError, ValueError) as e:
+        result.error = f"BadJSON: {str(e)[:120]}"
+        result.error_type = "BadJSON"
     except Exception as e:
         result.error = str(e)[:120]
         result.error_type = "Other"
 
-    result.latency_sec = time.perf_counter() - start
+    result.end_ts = time.perf_counter()
+    result.latency_sec = result.end_ts - start
     if result.ttfb_sec <= 0:
         result.ttfb_sec = result.latency_sec
     result.body_read_sec = max(result.latency_sec - result.ttfb_sec, 0.0)
@@ -573,7 +747,7 @@ async def _run_workers_for_duration(
     """
     通用并发压测引擎：启动 concurrency 个协程 worker，
     在 duration_sec 秒内循环发请求，直到时间到。
-    reference=True 时会带参考文本算 CER（accuracy_load 用）。
+    只要 ctx.reference_text 有值，就会计算 CER/WER。
     """
     results: list[RequestResult] = []
     error_types: dict[str, int] = {}
@@ -581,21 +755,12 @@ async def _run_workers_for_duration(
     level_start = time.perf_counter()
     stop_at = level_start + duration_sec
 
-    # 大部分压测不需要每条都算 CER，可关掉以省 CPU
     ref_ctx = ctx
-    if not reference:
-        ref_ctx = TestRunContext(
-            url=ctx.url,
-            audio=ctx.audio,
-            model=ctx.model,
-            timeout_s=ctx.timeout_s,
-            use_ssl=ctx.use_ssl,
-            reference_text=None,
-            hotwords=ctx.hotwords,
-        )
 
-    async def worker(session: aiohttp.ClientSession) -> None:
+    async def worker(session: aiohttp.ClientSession, initial_delay: float = 0.0) -> None:
         """单个工人：时间没到就不断发请求"""
+        if initial_delay > 0:
+            await asyncio.sleep(initial_delay)
         while time.perf_counter() < stop_at:
             payload = build_payload(ctx.audio.b64_data, model=ctx.model, hotwords=ctx.hotwords)
             res = await send_one_request(session, ref_ctx, payload)
@@ -606,11 +771,11 @@ async def _run_workers_for_duration(
 
     connector = aiohttp.TCPConnector(limit=max(concurrency + 5, 10))
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [asyncio.create_task(worker(session)) for _ in range(concurrency)]
         # 错峰启动：避免第一瞬间同时打出 concurrency 个请求
-        for i, t in enumerate(tasks):
-            if i < concurrency - 1 and stagger_sec > 0:
-                await asyncio.sleep(stagger_sec)
+        tasks = [
+            asyncio.create_task(worker(session, i * stagger_sec if stagger_sec > 0 else 0.0))
+            for i in range(concurrency)
+        ]
         await asyncio.gather(*tasks)  # 等待所有 worker 结束
 
     return results
@@ -649,12 +814,13 @@ async def run_baseline(
             )
             results: list[RequestResult] = []
             print(f"\n  [{model}]")
-            t0 = time.perf_counter()
+            model_start = time.perf_counter()
+            active_request_sec = 0.0
             for r in range(rounds):
                 payload = build_payload(ctx.audio.b64_data, model=model, hotwords=ctx.hotwords)
                 res = await send_one_request(session, model_ctx, payload)
-                if res.success:
-                    results.append(res)
+                active_request_sec += res.latency_sec
+                results.append(res)
                 cer_s = _fmt_pct_opt(res.cer) if res.cer is not None else "-"
                 wer_s = _fmt_pct_opt(res.wer) if res.wer is not None else "-"
                 tag = "✓" if res.success else "✗"
@@ -666,12 +832,13 @@ async def run_baseline(
                     f"{res.chars_per_sec:<10.1f} {res.ttfb_sec:<10.3f} {cer_s:<8} {wer_s:<8} {tag}  {preview}"
                 )
                 await asyncio.sleep(0.5)
-            wall = time.perf_counter() - t0
+            wall = time.perf_counter() - model_start
             m = build_stress_metrics(
                 TestKind.BASELINE.value, results, wall, ctx.audio.duration_sec, concurrency=1
             )
             m.extra["model"] = model
             m.extra["rounds"] = rounds
+            m.extra["请求活跃耗时"] = f"{active_request_sec:.3f}s"
             out[model] = m
             sample = results[-1].text if results else ""
             print_combined_result(m, ctx.audio, focus=model, sample_text=sample)
@@ -758,7 +925,7 @@ async def run_spike(
         TestKind.SPIKE,
         f"突发尖峰 — {low_concurrency}→{spike_concurrency}→{low_concurrency} 并发",
     )
-    phases: list[tuple[str, int, int, list[RequestResult]]] = []
+    phases: list[tuple[str, int, int, float, list[RequestResult]]] = []
     all_results: list[RequestResult] = []
     total_wall = 0.0
 
@@ -780,9 +947,12 @@ async def run_spike(
             ctx.audio.duration_sec,
             concurrency=conc,
         )
-        phases.append((phase_name, conc, dur, phase_results))
+        phases.append((phase_name, conc, dur, wall, phase_results))
         print_stress_metrics(pm, focus=phase_name)
-        print_asr_metrics(pm.asr, ctx.audio)
+        if pm.success_count > 0:
+            print_asr_metrics(pm.asr, ctx.audio)
+        else:
+            print("\n  ⚠️ 无成功请求，跳过 ASR 专项指标")
 
     m = build_stress_metrics(
         TestKind.SPIKE.value, all_results, total_wall, ctx.audio.duration_sec,
@@ -790,7 +960,7 @@ async def run_spike(
     )
     spike_phase = next(p for p in phases if p[0] == "尖峰")
     spike_m = build_stress_metrics(
-        "spike_peak", spike_phase[3], spike_phase[2], ctx.audio.duration_sec,
+        "spike_peak", spike_phase[4], spike_phase[3], ctx.audio.duration_sec,
         concurrency=spike_concurrency,
     )
     m.extra["尖峰成功率"] = f"{spike_m.success_rate:.1f}%"
@@ -816,59 +986,76 @@ async def run_soak(
         f"长时间浸泡 — {concurrency} 并发 × {duration_sec}s，每 {bucket_sec}s 分桶",
     )
     results: list[RequestResult] = []
-    bucket_latencies: list[tuple[int, float, float]] = []
+    bucket_lats_by_idx: dict[int, list[float]] = {}
+    bucket_success_by_idx: Counter[int] = Counter()
+    bucket_total_by_idx: Counter[int] = Counter()
     lock = asyncio.Lock()
     start = time.perf_counter()
     stop_at = start + duration_sec
-    bucket_idx = 0
-    bucket_start = start
-    bucket_lats: list[float] = []
 
     async def worker(session: aiohttp.ClientSession) -> None:
-        nonlocal bucket_idx, bucket_start, bucket_lats
         while time.perf_counter() < stop_at:
             payload = build_payload(ctx.audio.b64_data, model=ctx.model, hotwords=ctx.hotwords)
             ref_ctx = TestRunContext(
                 url=ctx.url, audio=ctx.audio, model=ctx.model,
                 timeout_s=ctx.timeout_s, use_ssl=ctx.use_ssl,
+                reference_text=ctx.reference_text,
+                hotwords=ctx.hotwords,
             )
             res = await send_one_request(session, ref_ctx, payload)
             async with lock:
                 results.append(res)
+                elapsed = max(res.end_ts - start, 0.0)
+                bucket_idx = int(elapsed // bucket_sec) if bucket_sec > 0 else 0
+                bucket_total_by_idx[bucket_idx] += 1
                 if res.success:
-                    bucket_lats.append(res.latency_sec)
-                now = time.perf_counter()
-                if now - bucket_start >= bucket_sec:
-                    if bucket_lats:
-                        bucket_latencies.append((
-                            bucket_idx,
-                            statistics.mean(bucket_lats),
-                            percentile(bucket_lats, 95),
-                        ))
-                    bucket_idx += 1
-                    bucket_start = now
-                    bucket_lats = []
+                    bucket_success_by_idx[bucket_idx] += 1
+                    bucket_lats_by_idx.setdefault(bucket_idx, []).append(res.latency_sec)
 
     connector = aiohttp.TCPConnector(limit=max(concurrency + 5, 10))
     async with aiohttp.ClientSession(connector=connector) as session:
         await asyncio.gather(*[worker(session) for _ in range(concurrency)])
 
     wall = time.perf_counter() - start
+    if bucket_sec > 0:
+        expected_last_bucket = max(0, math.ceil(duration_sec / bucket_sec) - 1)
+        wall_last_bucket = max(0, math.ceil(wall / bucket_sec) - 1)
+        seen_last_bucket = max(bucket_total_by_idx.keys(), default=0)
+        max_bucket_idx = max(expected_last_bucket, wall_last_bucket, seen_last_bucket)
+    else:
+        max_bucket_idx = 0
+    bucket_latencies: list[tuple[int, float, float, int, int]] = []
+    for idx in range(max_bucket_idx + 1):
+        lats = bucket_lats_by_idx.get(idx, [])
+        if lats:
+            avg_l = statistics.mean(lats)
+            p95_l = percentile(lats, 95)
+        else:
+            avg_l = 0.0
+            p95_l = 0.0
+        bucket_latencies.append((
+            idx,
+            avg_l,
+            p95_l,
+            bucket_success_by_idx[idx],
+            bucket_total_by_idx[idx],
+        ))
     m = build_stress_metrics(
         TestKind.SOAK.value, results, wall, ctx.audio.duration_sec, concurrency=concurrency
     )
 
-    if len(bucket_latencies) >= 2:
-        first_p95 = bucket_latencies[0][2]
-        last_p95 = bucket_latencies[-1][2]
+    non_empty_buckets = [b for b in bucket_latencies if b[3] > 0]
+    if len(non_empty_buckets) >= 2:
+        first_p95 = non_empty_buckets[0][2]
+        last_p95 = non_empty_buckets[-1][2]
         drift = ((last_p95 - first_p95) / first_p95 * 100) if first_p95 > 0 else 0.0
         m.extra["首桶P95延迟"] = f"{first_p95:.3f}s"
         m.extra["末桶P95延迟"] = f"{last_p95:.3f}s"
         m.extra["P95漂移"] = f"{drift:+.1f}%"
 
-    print("\n  分桶延迟趋势 (平均 / P95):")
-    for idx, avg_l, p95_l in bucket_latencies:
-        print(f"    桶 {idx + 1:>2}: 平均 {avg_l:.3f}s | P95 {p95_l:.3f}s")
+    print("\n  分桶延迟趋势 (平均 / P95 / 成功 / 总数):")
+    for idx, avg_l, p95_l, success_n, total_n in bucket_latencies:
+        print(f"    桶 {idx + 1:>2}: 平均 {avg_l:.3f}s | P95 {p95_l:.3f}s | {success_n}/{total_n}")
     print_combined_result(m, ctx.audio, focus="浸泡稳态")
     return m
 
@@ -887,23 +1074,33 @@ async def run_fixed_qps(
         TestKind.FIXED_QPS,
         f"固定速率 — 目标 {target_qps} QPS × {duration_sec}s，最大在途 {max_in_flight}",
     )
+    if target_qps <= 0 or duration_sec <= 0 or max_in_flight <= 0:
+        print("\n  ⚠️ fixed_qps 参数非法：target_qps、duration_sec、max_in_flight 必须大于 0")
+        return StressAggMetrics(test_kind=TestKind.FIXED_QPS.value, target_qps=target_qps)
+
     results: list[RequestResult] = []
     lock = asyncio.Lock()
-    interval = 1.0 / target_qps if target_qps > 0 else 1.0  # 两次请求之间的间隔
+    in_flight_sem = asyncio.Semaphore(max_in_flight)
+    interval = 1.0 / target_qps  # 两次请求之间的间隔
     start = time.perf_counter()
     stop_at = start + duration_sec
-    sem = asyncio.Semaphore(max_in_flight)  # 信号量：超过 max_in_flight 会等待
+    scheduled_count = 0
+    dropped_by_limit = 0
 
     async def one_shot(session: aiohttp.ClientSession) -> None:
-        async with sem:
+        try:
             payload = build_payload(ctx.audio.b64_data, model=ctx.model, hotwords=ctx.hotwords)
             ref_ctx = TestRunContext(
                 url=ctx.url, audio=ctx.audio, model=ctx.model,
                 timeout_s=ctx.timeout_s, use_ssl=ctx.use_ssl,
+                reference_text=ctx.reference_text,
+                hotwords=ctx.hotwords,
             )
             res = await send_one_request(session, ref_ctx, payload)
             async with lock:
                 results.append(res)
+        finally:
+            in_flight_sem.release()
 
     connector = aiohttp.TCPConnector(limit=max(max_in_flight + 5, 20))
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -912,22 +1109,36 @@ async def run_fixed_qps(
         while time.perf_counter() < stop_at:
             now = time.perf_counter()
             if now >= next_send:
-                tasks.append(asyncio.create_task(one_shot(session)))
+                if not in_flight_sem.locked():
+                    await in_flight_sem.acquire()
+                    scheduled_count += 1
+                    tasks.append(asyncio.create_task(one_shot(session)))
+                else:
+                    dropped_by_limit += 1
                 next_send += interval
             else:
                 await asyncio.sleep(min(0.001, next_send - now))
+        send_window_end = time.perf_counter()
         if tasks:
             await asyncio.gather(*tasks)
 
     wall = time.perf_counter() - start
-    planned = int(duration_sec * target_qps)
+    send_window_sec = max(send_window_end - start, 0.0)
+    drain_sec = max(wall - send_window_sec, 0.0)
+    planned = math.ceil(duration_sec * target_qps)
     m = build_stress_metrics(
         TestKind.FIXED_QPS.value, results, wall, ctx.audio.duration_sec,
         target_qps=target_qps,
     )
     m.extra["计划请求数"] = planned
-    m.extra["实际发出"] = len(results)
-    m.extra["达成率"] = f"{len(results) / planned * 100:.1f}%" if planned else "N/A"
+    m.extra["实际发起"] = scheduled_count
+    m.extra["完成请求数"] = len(results)
+    m.extra["在途上限跳过"] = dropped_by_limit
+    m.extra["发起窗口"] = f"{send_window_sec:.3f}s"
+    m.extra["排空耗时"] = f"{drain_sec:.3f}s"
+    m.extra["发起QPS"] = f"{scheduled_count / send_window_sec:.3f}" if send_window_sec > 0 else "N/A"
+    m.extra["完成QPS"] = f"{len(results) / wall:.3f}" if wall > 0 else "N/A"
+    m.extra["达成率"] = f"{scheduled_count / planned * 100:.1f}%" if planned else "N/A"
     print_combined_result(m, ctx.audio, focus=f"目标QPS={target_qps}")
     return m
 
@@ -939,10 +1150,10 @@ async def run_accuracy_load(
 ) -> StressAggMetrics:
     """
     【并发准确度】高并发下仍计算每条 CER，看压测是否导致识别变差或结果不一致。
-    必须提供 --reference-text。
+    需要参考文本文件或 --reference-text。
     """
     if not ctx.reference_text:
-        print("\n  ⚠️ accuracy_load 需要 --reference-text，已跳过")
+        print("\n  ⚠️ accuracy_load 需要参考文本文件或 --reference-text，已跳过")
         return StressAggMetrics(test_kind=TestKind.ACCURACY_LOAD.value)
 
     print_test_banner(
@@ -966,8 +1177,12 @@ async def run_accuracy_load(
             m.extra["CER>10%占比"] = f"{sum(1 for c in cers if c > 0.1) / len(cers) * 100:.1f}%"
         texts = [r.text for r in successes if r.text]
         if texts:
-            unique_ratio = len(set(texts)) / len(texts) * 100
-            m.extra["结果一致性"] = f"{100 - unique_ratio:.1f}% 相同"
+            text_counter = Counter(texts)
+            most_common_text, most_common_count = text_counter.most_common(1)[0]
+            consistency = most_common_count / len(texts) * 100
+            m.extra["结果一致性"] = f"{consistency:.1f}% 相同"
+            m.extra["唯一结果数"] = len(text_counter)
+            m.extra["主结果样例"] = most_common_text[:50] + ("…" if len(most_common_text) > 50 else "")
     sample = successes[0].text if successes else ""
     print_combined_result(m, ctx.audio, focus="并发准确度", sample_text=sample)
     return m
@@ -1050,6 +1265,8 @@ async def run(args: argparse.Namespace) -> None:
     audio = load_audio_meta(args.audio)
     use_ssl = args.url.lower().startswith("https")
     tests = parse_tests(args.tests)
+    reference_text = load_reference_text(args.reference_file, args.reference_text)
+    reference_source = resolve_reference_source(args.reference_file, args.reference_text)
 
     ctx = TestRunContext(
         url=args.url,
@@ -1057,7 +1274,7 @@ async def run(args: argparse.Namespace) -> None:
         model=args.stress_model or args.models[0],
         timeout_s=args.timeout,
         use_ssl=use_ssl,
-        reference_text=args.reference_text,
+        reference_text=reference_text,
         hotwords=args.hotwords,
     )
 
@@ -1066,9 +1283,10 @@ async def run(args: argparse.Namespace) -> None:
     print(f"  音频:     {audio.path} ({audio.duration_sec:.2f}s, {audio.file_kb}KB)")
     print(f"  压测模型: {ctx.model}")
     print(f"  测试项:   {', '.join(tests)}")
-    if args.reference_text:
-        print(f"  参考文本: {args.reference_text[:50]}{'…' if len(args.reference_text) > 50 else ''}")
-    if args.reference_text and not jiwer_cer:
+    if reference_text:
+        print(f"  参考来源: {reference_source}")
+        print(f"  参考文本: {reference_text[:50]}{'…' if len(reference_text) > 50 else ''}")
+    if reference_text and not jiwer_cer:
         print("  ⚠️ 未安装 jiwer: pip install jiwer 可获得标准 CER/WER")
 
     report: dict[str, Any] = {
@@ -1083,6 +1301,8 @@ async def run(args: argparse.Namespace) -> None:
             "url": args.url,
             "model": ctx.model,
             "tests": tests,
+            "reference_file": args.reference_file,
+            "reference_source": reference_source,
         },
     }
 
@@ -1177,11 +1397,12 @@ def main() -> None:
         default="all",
         help=f"逗号分隔或 all。可选: {', '.join(ALL_TEST_NAMES)}",
     )
-    parser.add_argument("--reference-text", default=None, help="参考文本 (CER/WER/accuracy_load)")
+    parser.add_argument("--reference-file", default=DEFAULT_REFERENCE_TEXT, help="参考文本文件 (CER/WER/accuracy_load)")
+    parser.add_argument("--reference-text", default=None, help="参考文本字符串；如提供则覆盖 --reference-file")
     parser.add_argument("--output", default=None, help="JSON 报告路径")
 
     # ---------- ramp 递增并发相关参数 ----------
-    parser.add_argument("--concurrency", nargs="+", type=int, default=[1, 2, 4, 8, 16, 32])
+    parser.add_argument("--concurrency", nargs="+", type=int, default=[1, 2, 4, 8, 10, 12,16, 32])
     parser.add_argument("--duration", type=int, default=30, help="ramp 每级持续秒数")
     parser.add_argument("--rounds", type=int, default=3, help="baseline 每模型轮次")
     parser.add_argument("--timeout", type=float, default=120)
