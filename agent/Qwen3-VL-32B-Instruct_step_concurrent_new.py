@@ -27,11 +27,11 @@ from typing import Any, Optional
 
 APP_KEY = os.getenv("APP_KEY", "1001300033")
 SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
-# URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
-URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
+# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
 COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100565")
-MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
-# MODEL = os.getenv("MODEL", "Qwen3-VL")  #公司环境
+# MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
+MODEL = os.getenv("MODEL", "Qwen3-VL")  #公司环境
 DEFAULT_CONCURRENCY_LEVELS = [20,22,24,26,28,30,32,34,36,38,40]
 DEFAULT_SYSTEM_PROMPT = "你是一个严谨的测试助手，请根据用户要求给出清晰、可验证的回答。"
 DEFAULT_USER_PROMPT = """
@@ -201,6 +201,7 @@ class RequestResult:
     error: str
     start_epoch: float
     end_epoch: float
+    send_perf: float
     total_ms: float
     header_ms: Optional[float] = None
     first_byte_ms: Optional[float] = None
@@ -223,6 +224,7 @@ class StepResult:
     failed_count: int
     success_rate: float
     total_duration_s: float
+    effective_duration_s: float
     success_qps: float
     total_qps: float
     configured_concurrency: int
@@ -641,6 +643,7 @@ class GatewayConcurrentTester:
                 error=error,
                 start_epoch=start_epoch,
                 end_epoch=end_epoch,
+                send_perf=start_perf,
                 total_ms=(end_perf - start_perf) * 1000,
                 header_ms=header_ms,
                 first_byte_ms=first_byte_ms,
@@ -754,6 +757,7 @@ class GatewayConcurrentTester:
             error=error[:300],
             start_epoch=start_epoch if started else time.time(),
             end_epoch=time.time(),
+            send_perf=start_perf if started else 0.0,
             total_ms=(end_perf - start_perf) * 1000 if started else 0.0,
         )
 
@@ -816,8 +820,8 @@ class GatewayConcurrentTester:
                     if sleep_seconds > 0:
                         time.sleep(sleep_seconds)
 
-        duration = time.perf_counter() - start
-        step = summarize_step(concurrency, total_requests, duration, peak_tracker.peak, burst_count, results)
+        total_duration = time.perf_counter() - start
+        step = summarize_step(concurrency, total_requests, total_duration, peak_tracker.peak, burst_count, results)
         print_step_report(step)
         return step, sorted(results, key=lambda item: item.request_id)
 
@@ -825,13 +829,20 @@ class GatewayConcurrentTester:
 def summarize_step(
     concurrency: int,
     total_requests: int,
-    duration: float,
+    total_duration: float,
     observed_peak: int,
     burst_rounds: int,
     results: list[RequestResult],
 ) -> StepResult:
     success = [item for item in results if item.success]
     failed = [item for item in results if not item.success]
+    sent_results = [item for item in results if item.send_perf > 0]
+    if sent_results:
+        effective_start = min(item.send_perf for item in sent_results)
+        effective_end = max(item.send_perf + item.total_ms / 1000 for item in sent_results)
+        effective_duration = max(effective_end - effective_start, 0.0)
+    else:
+        effective_duration = 0.0
     response_times = [item.total_ms for item in success]
     ttfb_times = [item.first_byte_ms for item in success if item.first_byte_ms is not None]
     ttft_times = [item.first_token_ms for item in success if item.first_token_ms is not None]
@@ -851,9 +862,10 @@ def summarize_step(
         success_count=len(success),
         failed_count=len(failed),
         success_rate=(len(success) / total_requests * 100) if total_requests else 0.0,
-        total_duration_s=duration,
-        success_qps=(len(success) / duration) if duration > 0 else 0.0,
-        total_qps=(len(results) / duration) if duration > 0 else 0.0,
+        total_duration_s=total_duration,
+        effective_duration_s=effective_duration,
+        success_qps=(len(success) / effective_duration) if effective_duration > 0 else 0.0,
+        total_qps=(len(sent_results) / effective_duration) if effective_duration > 0 else 0.0,
         configured_concurrency=concurrency,
         observed_peak_inflight=observed_peak,
         full_concurrency_bursts=sum(
@@ -873,7 +885,11 @@ def summarize_step(
         p95_ttft_ms=percentile(ttft_times, 95),
         total_completion_tokens=total_completion_tokens,
         token_usage_coverage=token_coverage,
-        output_token_throughput=(total_completion_tokens / duration) if duration > 0 and completion_tokens else None,
+        output_token_throughput=(
+            total_completion_tokens / effective_duration
+            if effective_duration > 0 and completion_tokens
+            else None
+        ),
         error_summary=dict(error_summary),
     )
 
@@ -897,7 +913,8 @@ def print_step_report(step: StepResult) -> None:
     )
     print(f"目标并发/实际峰值并发: {step.configured_concurrency}/{step.observed_peak_inflight}")
     print(f"总耗时: {step.total_duration_s:.2f}s")
-    print(f"总QPS/成功QPS: {step.total_qps:.2f}/{step.success_qps:.2f}")
+    print(f"有效压测耗时: {step.effective_duration_s:.2f}s")
+    print(f"总QPS/成功QPS: {step.total_qps:.2f}/{step.success_qps:.2f} (基于有效压测耗时)")
     print(
         "响应耗时: "
         f"avg={format_ms(step.avg_response_ms)}, "
@@ -911,7 +928,7 @@ def print_step_report(step: StepResult) -> None:
     print(
         "输出 token 吞吐: "
         f"{format_number(step.output_token_throughput, ' tok/s')} "
-        f"(usage覆盖率={step.token_usage_coverage:.2f}%)"
+        f"(基于有效压测耗时, usage覆盖率={step.token_usage_coverage:.2f}%)"
     )
     if step.error_summary:
         print("失败原因统计:")
@@ -1004,6 +1021,8 @@ def build_final_report(
         [
             "- 口径说明: 每个同步批次会先创建好请求对象并等待全部 worker 就绪，再统一释放发起网络请求；"
             "响应耗时从释放后开始统计，包含网络传输、服务端处理和响应读取。",
+            "- 总耗时包含同一阶梯内各 burst 之间的等待间隔；有效压测耗时从第一个请求实际发出到最后一个已发出请求完成，"
+            "QPS 和 token 吞吐均基于有效压测耗时计算。",
             "- TTFB 为响应体首字节耗时；TTFT 仅在 stream=True 且首次出现有效文本增量时统计；"
             "token 吞吐只基于接口返回 usage 的请求统计，并用 usage 覆盖率说明可信度。",
             f"- 拐点确认: 本次按连续 {effective_break_confirmations} 个阶梯触发风险条件确认拐点；"
@@ -1011,15 +1030,16 @@ def build_final_report(
             "",
             "## 阶梯结果",
             "",
-            "| 并发 | 同步批次 | 满并发批次 | 实际峰值 | 请求数 | 成功率 | 成功QPS | P95响应 | P99响应 | P95 TTFB | P95 TTFT | token吞吐 | usage覆盖率 |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 并发 | 同步批次 | 满并发批次 | 实际峰值 | 请求数 | 成功率 | 总耗时 | 有效压测耗时 | 总QPS | 成功QPS | P95响应 | P99响应 | P95 TTFB | P95 TTFT | token吞吐 | usage覆盖率 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for step in steps:
         lines.append(
             f"| {step.concurrency} | {step.burst_rounds} | "
             f"{step.full_concurrency_bursts} | {step.observed_peak_inflight} | {step.attempted_requests} | "
-            f"{step.success_rate:.2f}% | {step.success_qps:.2f} | {format_ms(step.p95_response_ms)} | "
+            f"{step.success_rate:.2f}% | {step.total_duration_s:.2f}s | {step.effective_duration_s:.2f}s | "
+            f"{step.total_qps:.2f} | {step.success_qps:.2f} | {format_ms(step.p95_response_ms)} | "
             f"{format_ms(step.p99_response_ms)} | {format_ms(step.p95_ttfb_ms)} | "
             f"{format_ms(step.p95_ttft_ms)} | {format_number(step.output_token_throughput, ' tok/s')} | "
             f"{step.token_usage_coverage:.2f}% |"
@@ -1095,7 +1115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--burst-interval", type=float, default=0.0, help="同一阶梯内两轮同步 burst 的最小间隔秒数")
     parser.add_argument("--start-timeout", type=float, default=30.0, help="等待一轮内所有 worker 就绪的超时时间")
     parser.add_argument("--start-concurrent", type=int, default=1)
-    parser.add_argument("--max-concurrent", type=int, default=40)
+    parser.add_argument("--max-concurrent", type=int, default=40) #最大并发数
     parser.add_argument("--step", type=int, default=1)
     parser.add_argument("--success-threshold", type=float, default=95.0, help="判定稳定并发的成功率阈值")
     parser.add_argument("--latency-growth-threshold", type=float, default=2.0, help="相邻阶梯 P95 增长倍数达到该值视为拐点")
