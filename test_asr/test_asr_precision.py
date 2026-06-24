@@ -40,6 +40,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import warnings
 import wave
 from collections import Counter
 from dataclasses import dataclass, field
@@ -82,7 +83,7 @@ REQUEST_TIMEOUT_SEC = int(os.environ.get("ASR_TIMEOUT_SEC", "21600"))
 LANGUAGE = os.environ.get("ASR_LANGUAGE", "zh")
 ASR_PROGRESS_INTERVAL_SEC = float(os.environ.get("ASR_PROGRESS_INTERVAL_SEC", "10"))
 
-# 一致性测试重复次数。大模型若存在采样随机性，同一音频多次结果不一致会被量化。短音频设置为 3，短音频设置为 1。
+# 一致性测试重复次数。大模型若存在采样随机性，同一音频多次结果不一致会被量化。短音频建议设置 3，长音频建议设置 1。
 CONSISTENCY_RUNS = int(os.environ.get("ASR_CONSISTENCY_RUNS", "1"))
 
 # SNR 鲁棒性测试默认开启。仅 WAV 音频且安装 numpy 时可生成加噪临时文件。
@@ -95,6 +96,9 @@ SNR_LEVELS_DB = [
 
 # BERTScore 模型可按现场离线模型位置替换。默认模型适合中文语义相似度评估。
 BERTSCORE_MODEL = os.environ.get("ASR_BERTSCORE_MODEL", "bert-base-chinese")
+
+# 实体匹配默认保持历史 substring 行为；如需降低包含误判，可设为 exact_token。
+ENTITY_MATCH_MODE = os.environ.get("ASR_ENTITY_MATCH_MODE", "substring")
 
 # 标点和 ITN 相关符号集合。ITN 主要关注数字、日期、百分比、金额、英文缩写等格式化结果。
 PUNCTUATION_CHARS = set("，。！？；：、,.!?;:()（）《》“”\"'")
@@ -200,10 +204,13 @@ def tokenize_words(text: str) -> List[str]:
     if not normalized:
         return []
     if " " in normalized:
-        return [t for t in normalized.split(" ") if t]
+        # WER 标准定义不应丢弃标点；空格分词路径仅去除空 token，保留标点参与编辑距离。
+        return [t for t in normalized.split(" ") if t.strip()]
     if jieba is not None:
-        return [t for t in jieba.lcut(normalized) if t.strip() and t not in PUNCTUATION_CHARS]
-    return list(normalize_for_cer(normalized))
+        # jieba 分词路径同样保留标点，避免过滤标点导致 WER 偏低。
+        return [t for t in jieba.lcut(normalized) if t.strip()]
+    # 字符级退化不能复用 normalize_for_cer，因为 CER 规范化会去掉标点；这里只小写并过滤空白字符。
+    return [ch for ch in normalized if not ch.isspace()]
 
 
 def calc_cer(reference: str, hypothesis: str) -> Optional[float]:
@@ -233,6 +240,7 @@ def calc_bertscore(reference: str, hypothesis: str) -> Tuple[Optional[float], st
     """
     BERTScore F1：调用成熟 bert_score 包计算语义相似度。
     未安装依赖或无参考文本时返回 N/A，而不是用其它指标冒充 BERTScore。
+    rescale_with_baseline=True 会按基线重缩放分数，通常更贴近人工评判尺度。
     """
     if not reference.strip():
         return None, "缺少人工参考文本"
@@ -248,7 +256,8 @@ def calc_bertscore(reference: str, hypothesis: str) -> Tuple[Optional[float], st
             lang="zh",
             model_type=BERTSCORE_MODEL,
             verbose=False,
-            rescale_with_baseline=False,
+            # 审查修正：默认启用 baseline 重缩放，使 BERTScore 分数更贴近人工评判。
+            rescale_with_baseline=True,
         )
         return float(f1[0].item()), ""
     except Exception as exc:  # pragma: no cover - 模型下载/离线环境差异
@@ -284,27 +293,94 @@ def calc_punctuation_accuracy(reference: str, hypothesis: str) -> Optional[float
     return calc_sequence_accuracy(extract_punctuation_sequence(reference), extract_punctuation_sequence(hypothesis))
 
 
+def extract_punctuation_labels(text: str) -> List[Tuple[int, str]]:
+    """
+    提取带位置的标点标签。
+    审查新增：标点 F1 需要统计预测标点是否出现在相同文本位置；这里用非空白、非标点字符计数作为位置索引。
+    """
+    labels = []
+    char_pos = 0
+    for ch in text or "":
+        if ch in PUNCTUATION_CHARS:
+            labels.append((char_pos, ch))
+        elif not ch.isspace():
+            char_pos += 1
+    return labels
+
+
+def calc_punctuation_f1(reference: str, hypothesis: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    标点精确率/召回率/F1。
+    审查新增：保留原有序列准确率，同时补充行业常用的标点 F1；参考文本无标点时返回 N/A。
+    """
+    ref_counter = Counter(extract_punctuation_labels(reference))
+    hyp_counter = Counter(extract_punctuation_labels(hypothesis))
+    ref_total = sum(ref_counter.values())
+    if ref_total == 0:
+        return None, None, None
+
+    hyp_total = sum(hyp_counter.values())
+    true_positive = sum((ref_counter & hyp_counter).values())
+    precision = true_positive / hyp_total if hyp_total else 0.0
+    recall = true_positive / ref_total
+    if precision + recall == 0:
+        return precision, recall, 0.0
+    return precision, recall, 2 * precision * recall / (precision + recall)
+
+
 def extract_itn_tokens(text: str) -> List[str]:
-    """抽取 ITN 关注 token：数字、日期、百分比、金额、英文缩写等。"""
+    """
+    抽取数字/金额/日期等格式化 token。
+    审查修正：该抽取仅用于比较特定格式化 token 序列，不代表真正的 ITN 归一化效果。
+    """
     return [m.group(0).replace(" ", "") for m in ITN_TOKEN_RE.finditer(text or "")]
 
 
 def calc_itn_accuracy(reference: str, hypothesis: str) -> Optional[float]:
-    """ITN 准确率：比较格式化 token 序列，参考中无 ITN token 时返回 N/A。"""
+    """
+    数字/金额/日期序列准确率：比较参考文本与识别文本中特定格式化 token 序列的编辑距离。
+    风险说明：保持原接口名以兼容历史调用，但该指标不包含中文数词到阿拉伯数字等真正 ITN 归一化能力评估。
+    """
     return calc_sequence_accuracy(extract_itn_tokens(reference), extract_itn_tokens(hypothesis))
 
 
-def calc_entity_accuracy(reference_entities: Sequence[str], hypothesis: str) -> Tuple[Optional[float], List[str]]:
+def calc_entity_accuracy(
+    reference_entities: Sequence[str],
+    hypothesis: str,
+    match_mode: str = "substring",
+) -> Tuple[Optional[float], List[str]]:
     """
-    关键实体准确率：按配置实体做精确包含匹配，适合专有名词、否定词、业务关键词。
+    关键实体准确率：按配置实体做匹配，适合专有名词、否定词、业务关键词。
+    match_mode="substring" 保持历史包含匹配；match_mode="exact_token" 要求实体作为完整连续 token 序列出现。
     返回值为 (命中率, 未命中实体列表)。
     """
     entities = [e for e in reference_entities if e]
     if not entities:
         return None, []
 
-    normalized_hyp = normalize_for_entity(hypothesis)
+    if match_mode not in {"substring", "exact_token"}:
+        warnings.warn(f"未知实体匹配模式 {match_mode}，已回退到 substring", RuntimeWarning)
+        match_mode = "substring"
+
     missed = []
+    if match_mode == "exact_token":
+        if jieba is None:
+            warnings.warn("实体 exact_token 匹配需要 jieba，当前已回退到 substring", RuntimeWarning)
+            match_mode = "substring"
+        else:
+            # 审查新增：exact_token 通过 jieba 分词后做连续 token 序列匹配，避免纯子串包含造成误判。
+            hyp_tokens = [normalize_for_entity(t) for t in jieba.lcut((hypothesis or "").lower()) if normalize_for_entity(t)]
+            for entity in entities:
+                entity_tokens = [normalize_for_entity(t) for t in jieba.lcut(entity.lower()) if normalize_for_entity(t)]
+                matched = any(
+                    hyp_tokens[idx:idx + len(entity_tokens)] == entity_tokens
+                    for idx in range(0, len(hyp_tokens) - len(entity_tokens) + 1)
+                ) if entity_tokens else False
+                if not matched:
+                    missed.append(entity)
+            return (len(entities) - len(missed)) / len(entities), missed
+
+    normalized_hyp = normalize_for_entity(hypothesis)
     for entity in entities:
         if normalize_for_entity(entity) not in normalized_hyp:
             missed.append(entity)
@@ -379,13 +455,16 @@ def make_noisy_wav(source_path: str, snr_db: float, output_path: str) -> None:
     计算公式：noise_power = signal_power / 10^(SNR/10)。
     """
     audio, sample_rate, _, _ = read_wav_mono_float32(source_path)
-    signal_power = float(np.mean(audio ** 2))
+    # 审查修正：先去除直流偏移再计算信号功率，避免静态偏置让 SNR 估计偏乐观。
+    audio_ac = audio - np.mean(audio)
+    signal_power = float(np.mean(audio_ac ** 2))
     if signal_power <= 0:
         raise RuntimeError("源音频能量为 0，无法按 SNR 加噪")
     noise_power = signal_power / (10 ** (snr_db / 10.0))
     rng = np.random.default_rng(seed=20260605 + int(snr_db * 10))
-    noise = rng.normal(0.0, math.sqrt(noise_power), size=audio.shape)
-    write_wav_int16(output_path, audio + noise, sample_rate)
+    noise = rng.normal(0.0, math.sqrt(noise_power), size=audio.shape).astype(np.float32)
+    noisy_audio = audio.astype(np.float32) + noise
+    write_wav_int16(output_path, noisy_audio, sample_rate)
 
 
 def query_gpu_by_nvidia_smi() -> Tuple[Optional[float], Optional[float], str]:
@@ -796,6 +875,9 @@ def evaluate_case(case: AsrMetricCase) -> Dict[str, Any]:
             "offline_tail_latency_sec": None,
             "latency_note": f"ASR 请求失败：status={result.status_code}, error={result.error}",
             "punctuation_acc": None,
+            "punctuation_precision": None,
+            "punctuation_recall": None,
+            "punctuation_f1": None,
             "itn_acc": None,
             "entity_acc": None,
             "missed_entities": [],
@@ -806,8 +888,9 @@ def evaluate_case(case: AsrMetricCase) -> Dict[str, Any]:
     bert_f1, bert_note = calc_bertscore(case.reference, result.text)
     hallucination = calc_hallucination(case.is_hallucination_probe, result.text)
     punctuation_acc = calc_punctuation_accuracy(case.reference, result.text)
+    punctuation_precision, punctuation_recall, punctuation_f1 = calc_punctuation_f1(case.reference, result.text)
     itn_acc = calc_itn_accuracy(case.reference, result.text)
-    entity_acc, missed_entities = calc_entity_accuracy(case.key_entities, result.text)
+    entity_acc, missed_entities = calc_entity_accuracy(case.key_entities, result.text, match_mode=ENTITY_MATCH_MODE)
     first_ts, last_ts = find_first_last_timestamp(result.response_json)
     first_latency, tail_latency, latency_note = extract_latency_fields(result.response_json)
     offline_tail_latency = max(0.0, result.elapsed_sec - duration) if duration else None
@@ -830,6 +913,9 @@ def evaluate_case(case: AsrMetricCase) -> Dict[str, Any]:
         "offline_tail_latency_sec": offline_tail_latency,
         "latency_note": latency_note,
         "punctuation_acc": punctuation_acc,
+        "punctuation_precision": punctuation_precision,
+        "punctuation_recall": punctuation_recall,
+        "punctuation_f1": punctuation_f1,
         "itn_acc": itn_acc,
         "entity_acc": entity_acc,
         "missed_entities": missed_entities,
@@ -926,6 +1012,9 @@ def save_result_csv(metrics: Sequence[Dict[str, Any]], output_path: str) -> None
         "tail_latency_sec",
         "offline_tail_latency_sec",
         "punctuation_acc",
+        "punctuation_precision",
+        "punctuation_recall",
+        "punctuation_f1",
         "itn_acc",
         "entity_acc",
         "missed_entities",
@@ -957,6 +1046,9 @@ def save_result_csv(metrics: Sequence[Dict[str, Any]], output_path: str) -> None
                     "tail_latency_sec": item["tail_latency_sec"],
                     "offline_tail_latency_sec": item["offline_tail_latency_sec"],
                     "punctuation_acc": item["punctuation_acc"],
+                    "punctuation_precision": item["punctuation_precision"],
+                    "punctuation_recall": item["punctuation_recall"],
+                    "punctuation_f1": item["punctuation_f1"],
                     "itn_acc": item["itn_acc"],
                     "entity_acc": item["entity_acc"],
                     "missed_entities": "；".join(item["missed_entities"]),
@@ -980,6 +1072,8 @@ def run_precision_suite() -> List[Dict[str, Any]]:
     print(f"CONSISTENCY_RUNS={CONSISTENCY_RUNS}, RUN_SNR_ROBUSTNESS={RUN_SNR_ROBUSTNESS}")
     print(f"WER 分词器={'jieba' if jieba is not None else '字符级回退（建议安装 jieba）'}")
     print(f"BERTScore={'已启用' if bert_score_score is not None else '未安装 bert_score，相关列输出 N/A'}")
+    print(f"实体匹配模式={ENTITY_MATCH_MODE}（substring 为兼容模式，exact_token 可降低子串误判）")
+    print("格式化序列准确率说明：仅衡量数字/金额/日期等 token 序列编辑距离，不代表真正 ITN 转化效果。")
 
     metrics = [evaluate_case(case) for case in cases]
 
@@ -999,6 +1093,7 @@ def run_precision_suite() -> List[Dict[str, Any]]:
                 fmt(item["bertscore_f1"]),
                 fmt(item["hallucination"]),
                 fmt(item["punctuation_acc"]),
+                fmt(item["punctuation_f1"]),
                 fmt(item["itn_acc"]),
                 fmt(item["entity_acc"]),
             ]
@@ -1017,8 +1112,9 @@ def run_precision_suite() -> List[Dict[str, Any]]:
             "BERTScore-F1",
             "幻觉",
             "标点准确率",
-            "ITN准确率",
-            "实体准确率",
+            "标点F1",
+            "格式化序列准确率",
+            f"实体准确率({ENTITY_MATCH_MODE})",
         ],
         detail_rows,
     )
@@ -1070,8 +1166,9 @@ def run_precision_suite() -> List[Dict[str, Any]]:
         ["平均 RTF", fmt(mean_optional(item["rtf"] for item in metrics), 3)],
         ["P95 耗时(s)", fmt(pct_optional((item["result"].elapsed_sec for item in metrics), 95), 3)],
         ["平均标点准确率", fmt(mean_optional(item["punctuation_acc"] for item in metrics))],
-        ["平均 ITN 准确率", fmt(mean_optional(item["itn_acc"] for item in metrics))],
-        ["平均实体准确率", fmt(mean_optional(item["entity_acc"] for item in metrics))],
+        ["平均标点F1", fmt(mean_optional(item["punctuation_f1"] for item in metrics))],
+        ["平均格式化序列准确率", fmt(mean_optional(item["itn_acc"] for item in metrics))],
+        [f"平均实体准确率({ENTITY_MATCH_MODE})", fmt(mean_optional(item["entity_acc"] for item in metrics))],
     ]
     print_table("汇总指标", ["指标", "值"], summary_rows)
 
