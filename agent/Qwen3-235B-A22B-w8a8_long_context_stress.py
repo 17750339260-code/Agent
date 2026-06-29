@@ -2,7 +2,7 @@
 #!/usr/bin/env python3
 """
 高并发压力测试脚本 - 长上下文极限测试
-
+评估大模型推理服务在高并发长上下文场景下承载能力的压测脚本。
 注意：--context-length 生成的是测试文本字符数，不是模型 token 数。
 真实 prompt/output token 数只以接口返回的 usage 字段为准。
 """
