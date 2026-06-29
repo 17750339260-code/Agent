@@ -1,3 +1,8 @@
+"""
+它主要用于批量评测或批量调用大模型接口，将 Excel 中的问题逐一提交到 AI 服务，
+并收集答案保存到 CSV 中。
+
+"""
 from __future__ import annotations
 import argparse
 import base64
