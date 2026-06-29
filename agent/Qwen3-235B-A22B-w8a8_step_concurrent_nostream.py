@@ -24,20 +24,20 @@ from datetime import datetime
 from email.utils import formatdate
 from pathlib import Path
 from typing import Any, Optional
-#
-# # 智学网级Qwen3-235B-A22B-w8a8大模型
-# APP_KEY = os.getenv("APP_KEY", "1001300033")
-# SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
-# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
-# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100567")
-# MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
 
-# 智学公司环境----Qwen3-235B-A22B-w8a8大模型
+# 智学网级Qwen3-235B-A22B-w8a8大模型
 APP_KEY = os.getenv("APP_KEY", "1001300033")
 SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
-URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
+URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
 COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100567")
 MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
+
+# # 智学公司环境----Qwen3-235B-A22B-w8a8大模型
+# APP_KEY = os.getenv("APP_KEY", "1001300033")
+# SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
+# URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
+# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100567")
+# MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
 
 
 DEFAULT_CONCURRENCY_LEVELS = [1,2,4,8,12,16,20,22,24,26,28,30,32,34,36,38,40]
