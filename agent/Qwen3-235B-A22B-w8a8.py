@@ -298,10 +298,20 @@ def parse_json(text: str) -> Any:
         return text
 
 
+def response_encoding(response: requests.Response) -> str:
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "charset=" in content_type:
+        return response.encoding or "utf-8"
+    if "application/json" in content_type or "text/event-stream" in content_type:
+        return "utf-8"
+    return response.encoding or "utf-8"
+
+
 def read_response(response: requests.Response, stream: bool, start: float) -> tuple[Any, int, int, float | None]:
     first_byte_ms = None
     response_bytes = 0
     stream_events = 0
+    encoding = response_encoding(response)
 
     if not stream:
         body = b""
@@ -313,7 +323,7 @@ def read_response(response: requests.Response, stream: bool, start: float) -> tu
             response_bytes += len(chunk)
             body += chunk
 
-        text = body.decode(response.encoding or "utf-8", errors="replace")
+        text = body.decode(encoding, errors="replace")
         return parse_json(text), response_bytes, stream_events, first_byte_ms
 
     raw_lines: list[str] = []
@@ -325,7 +335,7 @@ def read_response(response: requests.Response, stream: bool, start: float) -> tu
             first_byte_ms = (time.perf_counter() - start) * 1000
 
         response_bytes += len(raw_line)
-        line = raw_line.decode(response.encoding or "utf-8", errors="replace").strip()
+        line = raw_line.decode(encoding, errors="replace").strip()
         raw_lines.append(line)
 
         if line.startswith("data:"):
