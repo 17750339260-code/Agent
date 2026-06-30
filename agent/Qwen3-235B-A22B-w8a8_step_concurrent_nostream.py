@@ -75,14 +75,21 @@ DEFAULT_QUESTIONS = [
 ]
 DEFAULT_SYSTEM_PROMPT = "你是一个严谨的测试助手，请根据用户要求给出清晰、可验证的回答。"
 DEFAULT_USER_PROMPT = " "
+_QUESTION_RANDOM_LOCK = threading.Lock()
 
 
-def build_default_messages() -> list[dict[str, str]]:
-    question = random.choice(DEFAULT_QUESTIONS)
+def pick_random_question(exclude: Optional[str] = None) -> str:
+    candidates = [item for item in DEFAULT_QUESTIONS if item != exclude]
+    with _QUESTION_RANDOM_LOCK:
+        return random.choice(candidates or DEFAULT_QUESTIONS)
+
+
+def build_default_messages(question: Optional[str] = None, system_prompt: Optional[str] = None) -> list[dict[str, str]]:
+    question = question or pick_random_question()
     return [
         {
             "role": "system",
-            "content": "你是一本百科全书,熟知世界上所有问题。",
+            "content": system_prompt or DEFAULT_SYSTEM_PROMPT,
         },
         {"role": "user", "content": f"{question}/no_think"},
     ]
@@ -141,6 +148,15 @@ class StepResult:
     total_completion_tokens: int
     token_usage_coverage: float
     output_token_throughput: Optional[float]
+    all_avg_response_ms: Optional[float]
+    all_p50_response_ms: Optional[float]
+    all_p90_response_ms: Optional[float]
+    all_p95_response_ms: Optional[float]
+    all_p99_response_ms: Optional[float]
+    all_min_response_ms: Optional[float]
+    all_max_response_ms: Optional[float]
+    nominal_total_completion_tokens: int
+    nominal_output_token_throughput: Optional[float]
     error_summary: dict[str, int] = field(default_factory=dict)
 
 
@@ -176,11 +192,30 @@ def image_to_content_item(path: str) -> dict[str, Any]:
     }
 
 
-def make_payload(args: argparse.Namespace) -> dict[str, Any]:
+def build_user_content(user_text: str, image_paths: Optional[list[str]]) -> Any:
+    if not image_paths:
+        return user_text
+    return [{"type": "text", "text": user_text}] + [
+        image_to_content_item(path) for path in image_paths
+    ]
+
+
+def make_payload(args: argparse.Namespace, question: Optional[str] = None) -> dict[str, Any]:
+    system_prompt = read_text_arg(args.system_prompt)
+    user_prompt = read_text_arg(args.user_prompt)
+    if user_prompt.strip():
+        user_content = build_user_content(user_prompt, args.image)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+    else:
+        question = question or pick_random_question()
+        messages = build_default_messages(question, system_prompt)
     payload: dict[str, Any] = {
         "componentCode": args.component_code,
         "model": args.model,
-        "messages": build_default_messages(),
+        "messages": messages,
         "stream": args.stream,
     }
     if args.max_tokens is not None:
@@ -413,8 +448,14 @@ class StartGate:
 class GatewayConcurrentTester:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.current_question: Optional[str] = None
         self.payload = make_payload(args)
         self.ssl_context = None if args.verify_ssl else ssl._create_unverified_context()
+
+    def refresh_step_payload(self) -> str:
+        self.current_question = pick_random_question(self.current_question)
+        self.payload = make_payload(self.args, self.current_question)
+        return self.current_question
 
     def send_request(
         self,
@@ -437,9 +478,10 @@ class GatewayConcurrentTester:
         usage_source: Any = None
 
         try:
+            payload = make_payload(self.args) if self.args.random_per_request else self.payload
             request = urllib.request.Request(
                 self.args.url,
-                data=json.dumps(self.payload, ensure_ascii=False).encode("utf-8"),
+                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 headers=make_headers(self.args.app_key, self.args.secret_key),
                 method="POST",
             )
@@ -659,6 +701,13 @@ class GatewayConcurrentTester:
             f"开始测试并发 {concurrency}: 请求数={total_requests}, "
             f"同步批次={burst_count}, stream={self.args.stream}"
         )
+        question = self.refresh_step_payload()
+        if self.args.random_per_request:
+            print("本阶梯每个请求都会从 DEFAULT_QUESTIONS 中独立随机选择问题")
+        elif read_text_arg(self.args.user_prompt).strip():
+            print("本阶梯使用 --user-prompt 指定的固定请求内容")
+        else:
+            print(f"本阶梯固定问题: {question}")
         print(f"{'=' * 72}")
         start = time.perf_counter()
         next_request_id = 1
@@ -730,12 +779,17 @@ def summarize_step(
     else:
         effective_duration = 0.0
     response_times = [item.total_ms for item in success]
+    all_response_times = [item.total_ms for item in sent_results]
     ttfb_times = [item.first_byte_ms for item in success if item.first_byte_ms is not None]
     ttft_times = [item.first_token_ms for item in success if item.first_token_ms is not None]
     completion_tokens = [
         item.completion_tokens for item in success if item.completion_tokens is not None
     ]
+    all_completion_tokens = [
+        item.completion_tokens for item in results if item.completion_tokens is not None
+    ]
     total_completion_tokens = sum(completion_tokens)
+    nominal_total_completion_tokens = sum(all_completion_tokens)
     token_coverage = (len(completion_tokens) / len(success) * 100) if success else 0.0
     error_summary = Counter(normalize_error(item.error) for item in failed)
     burst_sizes = Counter(item.burst_id for item in results)
@@ -776,6 +830,19 @@ def summarize_step(
             if effective_duration > 0 and completion_tokens
             else None
         ),
+        all_avg_response_ms=average(all_response_times),
+        all_p50_response_ms=percentile(all_response_times, 50),
+        all_p90_response_ms=percentile(all_response_times, 90),
+        all_p95_response_ms=percentile(all_response_times, 95),
+        all_p99_response_ms=percentile(all_response_times, 99),
+        all_min_response_ms=min(all_response_times) if all_response_times else None,
+        all_max_response_ms=max(all_response_times) if all_response_times else None,
+        nominal_total_completion_tokens=nominal_total_completion_tokens,
+        nominal_output_token_throughput=(
+            nominal_total_completion_tokens / total_duration
+            if total_duration > 0 and all_completion_tokens
+            else None
+        ),
         error_summary=dict(error_summary),
     )
 
@@ -802,19 +869,32 @@ def print_step_report(step: StepResult) -> None:
     print(f"有效压测耗时: {step.effective_duration_s:.2f}s")
     print(f"总QPS/成功QPS: {step.total_qps:.2f}/{step.success_qps:.2f} (基于有效压测耗时)")
     print(
-        "响应耗时: "
+        "成功响应耗时: "
         f"avg={format_ms(step.avg_response_ms)}, "
         f"p50={format_ms(step.p50_response_ms)}, "
         f"p95={format_ms(step.p95_response_ms)}, "
         f"p99={format_ms(step.p99_response_ms)}, "
         f"max={format_ms(step.max_response_ms)}"
     )
-    print(f"TTFB: avg={format_ms(step.avg_ttfb_ms)}, p95={format_ms(step.p95_ttfb_ms)}")
-    print(f"TTFT(stream文本首包): avg={format_ms(step.avg_ttft_ms)}, p95={format_ms(step.p95_ttft_ms)}")
     print(
-        "输出 token 吞吐: "
+        "全量响应耗时(成功+失败/超时): "
+        f"avg={format_ms(step.all_avg_response_ms)}, "
+        f"p50={format_ms(step.all_p50_response_ms)}, "
+        f"p95={format_ms(step.all_p95_response_ms)}, "
+        f"p99={format_ms(step.all_p99_response_ms)}, "
+        f"max={format_ms(step.all_max_response_ms)}"
+    )
+    print(f"TTFB: avg={format_ms(step.avg_ttfb_ms)}, p95={format_ms(step.p95_ttfb_ms)}")
+    print(f"TTFT(stream文本首包, no-stream为N/A): avg={format_ms(step.avg_ttft_ms)}, p95={format_ms(step.p95_ttft_ms)}")
+    print(
+        "有效输出 token 吞吐: "
         f"{format_number(step.output_token_throughput, ' tok/s')} "
         f"(基于有效压测耗时, usage覆盖率={step.token_usage_coverage:.2f}%)"
+    )
+    print(
+        "名义输出 token 吞吐: "
+        f"{format_number(step.nominal_output_token_throughput, ' tok/s')} "
+        f"(总 completion tokens / 总耗时)"
     )
     if step.error_summary:
         print("失败原因统计:")
@@ -832,14 +912,14 @@ def is_breaking_point(
         return True, f"成功率 {current.success_rate:.2f}% < 阈值 {success_threshold:.2f}%"
     if (
         previous
-        and previous.p95_response_ms
-        and current.p95_response_ms
-        and current.p95_response_ms > previous.p95_response_ms * latency_growth_threshold
+        and previous.all_p95_response_ms is not None
+        and current.all_p95_response_ms is not None
+        and current.all_p95_response_ms > previous.all_p95_response_ms * latency_growth_threshold
     ):
         return (
             True,
-            f"P95 响应耗时从 {previous.p95_response_ms:.2f}ms 增长到 "
-            f"{current.p95_response_ms:.2f}ms，超过 {latency_growth_threshold:.2f} 倍",
+            f"全量 P95 响应耗时从 {previous.all_p95_response_ms:.2f}ms 增长到 "
+            f"{current.all_p95_response_ms:.2f}ms，超过 {latency_growth_threshold:.2f} 倍",
         )
     return False, ""
 
@@ -875,7 +955,7 @@ def build_final_report(
         )
 
     lines = [
-        "# Qwen3-VL-32B-Instruct 阶梯并发测试报告",
+        "# Qwen3-235B-A22B-w8a8 阶梯并发测试报告",
         "",
         f"- 生成时间: {now}",
         f"- URL: {args.url}",
@@ -885,7 +965,7 @@ def build_final_report(
         f"- 请求计划: {format_request_plan(args)}",
         f"- 并发级别: {level_text}",
         f"- 成功率阈值: {args.success_threshold:.2f}%",
-        f"- P95增长拐点阈值: {args.latency_growth_threshold:.2f}倍",
+        f"- 全量P95增长拐点阈值: {args.latency_growth_threshold:.2f}倍",
         "",
         "## 结论",
         "",
@@ -895,7 +975,9 @@ def build_final_report(
         lines.append(
             f"- 最佳达标成功QPS: 并发 {best_healthy_qps.concurrency}，"
             f"成功QPS={best_healthy_qps.success_qps:.2f}，"
-            f"成功率={best_healthy_qps.success_rate:.2f}%，P95={format_ms(best_healthy_qps.p95_response_ms)}。"
+            f"成功率={best_healthy_qps.success_rate:.2f}%，"
+            f"成功P95={format_ms(best_healthy_qps.p95_response_ms)}，"
+            f"全量P95={format_ms(best_healthy_qps.all_p95_response_ms)}。"
         )
     elif best_observed_qps:
         lines.append(
@@ -907,17 +989,19 @@ def build_final_report(
         [
             "- 口径说明: 每个同步批次会先创建好请求对象并等待全部 worker 就绪，再统一释放发起网络请求；"
             "响应耗时从释放后开始统计，包含网络传输、服务端处理和响应读取。",
-            "- 总耗时包含同一阶梯内各 burst 之间的等待间隔；有效压测耗时从第一个请求实际发出到最后一个已发出请求完成，"
-            "QPS 和 token 吞吐均基于有效压测耗时计算。",
+            "- 当前执行模型是同步 burst：一批请求全部完成后才进入下一批；有效压测耗时从第一个请求实际发出到最后一个已发出请求完成，"
+            "会包含同一阶梯内各 burst 之间的等待间隔。QPS 和有效 token 吞吐基于有效压测耗时计算；名义 token 吞吐基于总耗时计算。",
             "- TTFB 为响应体首字节耗时；TTFT 仅在 stream=True 且首次出现有效文本增量时统计；"
-            "token 吞吐只基于接口返回 usage 的请求统计，并用 usage 覆盖率说明可信度。",
+            "非流式请求无法得到真实首 token 时间。token 吞吐只基于接口返回 usage 的请求统计，并用 usage 覆盖率说明可信度。",
+            "- 默认每个阶梯固定一个请求内容以降低阶梯比较噪声；传入 --random-per-request 时，每个请求会独立随机选择题库问题。",
+            "- 成功响应耗时只统计成功请求；全量响应耗时统计所有已实际发出的请求，包含失败和超时请求的 total_ms；拐点判断使用全量 P95。",
             f"- 拐点确认: 本次按连续 {effective_break_confirmations} 个阶梯触发风险条件确认拐点；"
             "若成功率低于提前停止阈值，则直接确认当前风险点。",
             "",
             "## 阶梯结果",
             "",
-            "| 并发 | 同步批次 | 满并发批次 | 实际峰值 | 请求数 | 成功率 | 总耗时 | 有效压测耗时 | 总QPS | 成功QPS | P95响应 | P99响应 | P95 TTFB | P95 TTFT | token吞吐 | usage覆盖率 |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 并发 | 同步批次 | 满并发批次 | 实际峰值 | 请求数 | 成功率 | 总耗时 | 有效压测耗时 | 总QPS | 成功QPS | 成功P95响应 | 成功P99响应 | 全量P95响应 | 全量P99响应 | P95 TTFB | P95 TTFT | 有效token吞吐 | 名义token吞吐 | usage覆盖率 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for step in steps:
@@ -926,8 +1010,10 @@ def build_final_report(
             f"{step.full_concurrency_bursts} | {step.observed_peak_inflight} | {step.attempted_requests} | "
             f"{step.success_rate:.2f}% | {step.total_duration_s:.2f}s | {step.effective_duration_s:.2f}s | "
             f"{step.total_qps:.2f} | {step.success_qps:.2f} | {format_ms(step.p95_response_ms)} | "
-            f"{format_ms(step.p99_response_ms)} | {format_ms(step.p95_ttfb_ms)} | "
+            f"{format_ms(step.p99_response_ms)} | {format_ms(step.all_p95_response_ms)} | "
+            f"{format_ms(step.all_p99_response_ms)} | {format_ms(step.p95_ttfb_ms)} | "
             f"{format_ms(step.p95_ttft_ms)} | {format_number(step.output_token_throughput, ' tok/s')} | "
+            f"{format_number(step.nominal_output_token_throughput, ' tok/s')} | "
             f"{step.token_usage_coverage:.2f}% |"
         )
 
@@ -952,7 +1038,7 @@ def write_reports(
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    prefix = f"qwen3_vl_concurrent_{timestamp}"
+    prefix = f"qwen3_235b_concurrent_{timestamp}"
     summary_csv = report_dir / f"{prefix}_summary.csv"
     detail_csv = report_dir / f"{prefix}_details.csv"
     markdown = report_dir / f"{prefix}_report.md"
@@ -980,7 +1066,7 @@ def write_reports(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Qwen3-VL-32B-Instruct 阶梯并发压测脚本（仅使用 Python 标准库）")
+    parser = argparse.ArgumentParser(description="Qwen3-235B-A22B-w8a8 阶梯并发压测脚本（仅使用 Python 标准库）")
     parser.add_argument("--app-key", default=APP_KEY)
     parser.add_argument("--secret-key", default=SECRET_KEY)
     parser.add_argument("--url", default=URL)
@@ -999,12 +1085,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total", type=int, default=None, help="每个并发级别的最少请求总数；会自动补齐为当前并发的整数倍")
     parser.add_argument("--rounds", type=int, default=5, help="未指定 --total 时，每个并发级别执行多少轮同步 burst")
     parser.add_argument("--burst-interval", type=float, default=0.0, help="同一阶梯内两轮同步 burst 的最小间隔秒数")
+    parser.add_argument("--random-per-request", action="store_true", help="每个请求独立随机选择题库问题；默认每个阶梯固定一个请求内容")
     parser.add_argument("--start-timeout", type=float, default=30.0, help="等待一轮内所有 worker 就绪的超时时间")
     parser.add_argument("--start-concurrent", type=int, default=1)
     parser.add_argument("--max-concurrent", type=int, default=40) #最大并发数
     parser.add_argument("--step", type=int, default=1)
     parser.add_argument("--success-threshold", type=float, default=95.0, help="判定稳定并发的成功率阈值")
-    parser.add_argument("--latency-growth-threshold", type=float, default=2.0, help="相邻阶梯 P95 增长倍数达到该值视为拐点")
+    parser.add_argument("--latency-growth-threshold", type=float, default=2.0, help="相邻阶梯全量 P95 增长倍数达到该值视为拐点")
     parser.add_argument("--stop-success-rate", type=float, default=50.0, help="成功率低于该值时提前停止")
     parser.add_argument("--break-confirmations", type=int, default=2, help="连续触发多少个阶梯后确认拐点；单阶测试自动按 1 处理")
     parser.add_argument("--report-dir", default="reports")
@@ -1076,7 +1163,7 @@ def main() -> int:
 
     tester = GatewayConcurrentTester(args)
     if args.print_payload:
-        print("请求 payload:")
+        print("示例请求 payload；默认每个并发阶梯会固定一个请求内容，传入 --random-per-request 时每个请求独立随机:")
         print(json.dumps(tester.payload, ensure_ascii=False, indent=2))
 
     if args.concurrent:
@@ -1086,7 +1173,7 @@ def main() -> int:
     else:
         levels = DEFAULT_CONCURRENCY_LEVELS
 
-    print("\nQwen3-VL-32B-Instruct 阶梯并发测试")
+    print("\nQwen3-235B-A22B-w8a8 阶梯并发测试")
     print(f"目标URL: {args.url}")
     print(f"并发级别: {levels}")
     print(f"请求计划: {format_request_plan(args)}")
