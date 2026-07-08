@@ -38,7 +38,7 @@ FunASR 语音识别服务 — ASR 压力测试全集
   python "test_asr/asr_api_npu_concurrency .py"
   python "test_asr/asr_api_npu_concurrency .py" --tests baseline,ramp
   python "test_asr/asr_api_npu_concurrency .py" --tests all
-  # 默认读取 test_asr/asr_test_json/asr_reference_text.txt 作为 CER/WER 参考文本
+  # 默认读取音频同目录下的 asr_reference_text.txt 作为 CER/WER 参考文本
 """
 
 from __future__ import annotations
@@ -59,8 +59,12 @@ import unicodedata   # 全角/半角归一化、标点分类
 import wave          # 读取 wav 头信息（采样率、时长）
 from collections import Counter
 from dataclasses import asdict, dataclass, field  # 数据类，少写样板代码
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
+import hmac
+import shutil
+import subprocess
+from hashlib import sha256
 from typing import Any, Optional  # 类型标注，方便阅读
 
 import aiohttp         # 异步 HTTP 客户端，用来调 ASR 接口
@@ -80,12 +84,25 @@ except ImportError:
 
 # ==================== 默认配置（不改命令行时就用这些） ====================
 
-DEFAULT_API_URL = "http://36.111.82.53:10017/v1/audio/trans"  # ASR 服务地址
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目根目录
-DEFAULT_AUDIO = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "1.wav")  # 默认测试音频
+# DEFAULT_GATEWAY_URL = "https://10.134.252.232:5030/ai-gateway/predict"
+# DEFAULT_GATEWAY_APP_KEY = "1000400672300031"
+# DEFAULT_GATEWAY_SECRET_KEY = "b899eef382324e8d8973493fb9c35998"
+# DEFAULT_GATEWAY_COMPONENT_CODE = "04351378"
+# DEFAULT_GATEWAY_FUNCTION = "funasr-iic"
+# 评测网关
+DEFAULT_GATEWAY_URL = "https://10.134.252.232:5030/ai-gateway/predict"
+DEFAULT_GATEWAY_APP_KEY = "1000400672300031"
+DEFAULT_GATEWAY_SECRET_KEY = "b899eef382324e8d8973493fb9c35998"
+DEFAULT_GATEWAY_COMPONENT_CODE = "04351378"
+DEFAULT_GATEWAY_FUNCTION = "funasr-iic"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # 项目根目录
+DEFAULT_AUDIO = os.path.join(SCRIPT_DIR, "61.wav")
+REFERENCE_TEXT_FILENAME = "asr_reference_text.txt"
 DEFAULT_REFERENCE_TEXT = os.path.join(
-    PROJECT_ROOT, "test_asr", "asr_test_json", "asr_reference_text.txt"
-)  # 默认参考文本，用于计算 CER/WER
+    os.path.dirname(DEFAULT_AUDIO), REFERENCE_TEXT_FILENAME
+)  # 默认参考文本，与默认音频放在同一目录，用于计算 CER/WER
 
 # HTTPS 时跳过证书校验（内网/自签证书场景）
 SSL_CTX = ssl.create_default_context()
@@ -94,6 +111,16 @@ SSL_CTX.verify_mode = ssl.CERT_NONE
 
 # 部分损坏的 wav 头会写成超大时长，超过 1 小时则不可信
 MAX_REASONABLE_AUDIO_SECONDS = 3600.0
+
+
+class LoadTestHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
+    """Avoid misleading defaults on mutually exclusive boolean switches."""
+
+    def _get_help_string(self, action: argparse.Action) -> str:
+        if action.dest in {"gateway", "use_data_uri"}:
+            return action.help or ""
+        return super()._get_help_string(action)
+
 
 # --tests 参数可选的全部压测名称
 ALL_TEST_NAMES = (
@@ -104,6 +131,8 @@ ALL_TEST_NAMES = (
     "soak",
     "fixed_qps",
     "accuracy_load",
+    "fixed_requests",
+    "acceptance",
 )
 
 
@@ -116,6 +145,8 @@ class TestKind(str, Enum):
     SOAK = "soak"
     FIXED_QPS = "fixed_qps"
     ACCURACY_LOAD = "accuracy_load"
+    FIXED_REQUESTS = "fixed_requests"
+    ACCEPTANCE = "acceptance"
 
 
 # ==================== 数据结构（用 dataclass 打包相关字段，方便传递） ====================
@@ -130,6 +161,10 @@ class AudioMeta:
     sample_rate: int       # 采样率，如 16000
     channels: int          # 声道数，1=单声道
     b64_data: str          # 整段音频的 base64，请求时放进 JSON
+
+    media_format: str = ""
+    codec: str = ""
+    duration_source: str = ""
 
     @property
     def b64_kb(self) -> int:
@@ -165,10 +200,10 @@ class RequestResult:
 @dataclass
 class AsrAggMetrics:
     """多笔成功请求汇总后的 ASR 专项指标"""
-    avg_latency: float = 0.0        # 平均延迟
-    p50_latency: float = 0.0        # 50% 的请求延迟低于此值（中位数）
-    p95_latency: float = 0.0        # 95% 的请求延迟低于此值
-    p99_latency: float = 0.0        # 99 分位延迟
+    avg_latency: float = 0.0        # 成功请求平均延迟
+    p50_latency: float = 0.0        # 成功请求 P50 延迟
+    p95_latency: float = 0.0        # 成功请求 P95 延迟
+    p99_latency: float = 0.0        # 成功请求 P99 延迟
     avg_ttfb: float = 0.0
     p95_ttfb: float = 0.0
     avg_rtf: float = 0.0            # 平均实时因子
@@ -200,6 +235,9 @@ class StressAggMetrics:
     success_rate: float = 0.0       # 成功率（%）
     attempt_qps: float = 0.0        # 总请求数 / 墙钟时间
     success_qps: float = 0.0        # 成功数 / 墙钟时间
+    avg_response_latency: float = 0.0  # 全部请求平均响应耗时（成功+失败）
+    p95_response_latency: float = 0.0  # 全部请求 P95 响应耗时（成功+失败）
+    p99_response_latency: float = 0.0  # 全部请求 P99 响应耗时（成功+失败）
     error_types: dict[str, int] = field(default_factory=dict)  # 各类错误次数
     extra: dict[str, Any] = field(default_factory=dict)        # 额外说明项
     asr: AsrAggMetrics = field(default_factory=AsrAggMetrics)
@@ -215,69 +253,189 @@ class TestRunContext:
     use_ssl: bool                   # 是否 HTTPS
     reference_text: Optional[str] = None  # 标准答案，用于算 CER/WER
     hotwords: str = ""              # 热词，传给接口
+    gateway: bool = False           # 是否走 AI Gateway /predict 统一入口
+    component_code: str = ""        # 网关组件编码
+    app_key: str = ""               # 网关客户编码 / app key
+    secret_key: str = ""            # 网关签名密钥
+    gateway_function: str = ""      # 网关 function 字段，默认等于模型名
+    use_data_uri: bool = False      # 网关 ASR 示例使用 data:audio/...;base64,... 输入
+    include_stream_param: bool = False  # 是否在 payload 中写入 stream=True/False
+    stream_param_name: str = "stream"
+    is_return_timestamp: bool = False
 
 
 # ==================== 工具函数（音频、指标计算、拼请求体） ====================
 
 
-def _duration_from_pcm_bytes(
-    pcm_bytes: int, sample_rate: int, channels: int, sample_width: int
-) -> float:
-    """根据 PCM 字节数估算音频时长（秒）"""
-    denom = sample_rate * channels * sample_width
-    if denom <= 0 or pcm_bytes <= 0:
+def resolve_input_path(path: str, *, default_base: str = PROJECT_ROOT) -> str:
+    """Resolve an input file path from cwd first, then script/project locations."""
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+
+    candidates = [
+        os.path.abspath(path),
+        os.path.abspath(os.path.join(SCRIPT_DIR, path)),
+        os.path.abspath(os.path.join(default_base, path)),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def default_reference_path_for_audio(audio_path: str) -> str:
+    """Default reference text lives next to the resolved audio file."""
+    return os.path.join(os.path.dirname(os.path.abspath(audio_path)), REFERENCE_TEXT_FILENAME)
+
+
+def resolve_reference_path(reference_file: Optional[str], audio_path: str) -> Optional[str]:
+    """Resolve explicit reference file, or fall back to audio-directory default."""
+    if reference_file == "":
+        return None
+    if reference_file:
+        audio_dir = os.path.dirname(os.path.abspath(audio_path))
+        return resolve_input_path(reference_file, default_base=audio_dir)
+    return default_reference_path_for_audio(audio_path)
+
+
+def _is_riff_wave(raw: bytes) -> bool:
+    return len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WAVE"
+
+
+def _float_from_probe(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
         return 0.0
-    return pcm_bytes / float(denom)
+    return result if math.isfinite(result) and result > 0 else 0.0
+
+
+def _int_from_probe(value: Any) -> int:
+    try:
+        result = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return result if result > 0 else 0
+
+
+def _probe_audio_with_ffprobe(audio_path: str) -> Optional[dict[str, Any]]:
+    """Read duration/codec metadata for compressed or mislabeled audio files."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_name,codec_type,sample_rate,channels,duration:format=duration,format_name",
+        "-of",
+        "json",
+        audio_path,
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if completed.returncode != 0:
+        return None
+
+    try:
+        data = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+
+    streams = data.get("streams") or []
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    fmt = data.get("format") or {}
+    duration_sec = _float_from_probe(audio_stream.get("duration")) or _float_from_probe(
+        fmt.get("duration")
+    )
+    if duration_sec <= 0:
+        return None
+
+    return {
+        "duration_sec": duration_sec,
+        "sample_rate": _int_from_probe(audio_stream.get("sample_rate")),
+        "channels": _int_from_probe(audio_stream.get("channels")),
+        "codec": str(audio_stream.get("codec_name") or ""),
+        "media_format": str(fmt.get("format_name") or ""),
+        "duration_source": "ffprobe",
+    }
+
+
+def _abort_untrusted_audio_duration(audio_path: str, reason: str) -> None:
+    print(f"❌ 无法可靠识别音频时长，已停止测试: {audio_path}")
+    print(f"   原因: {reason}")
+    print("   请安装 ffmpeg/ffprobe，或将测试音频转换为标准 PCM WAV 后重试。")
+    sys.exit(1)
 
 
 def load_audio_meta(audio_path: str) -> AudioMeta:
-    """
-    读取 wav 文件：解析时长、采样率，并生成 base64。
-    若 wav 头损坏，会按文件大小估算时长。
-    """
+    """Read audio metadata and base64 payload using trusted duration sources."""
+    audio_path = resolve_input_path(audio_path, default_base=SCRIPT_DIR)
     if not os.path.exists(audio_path):
-        print(f"❌ 音频文件不存在: {audio_path}")
+        print(f"ERROR: audio file does not exist: {audio_path}")
+        print(f"       default audio path: {DEFAULT_AUDIO}")
         sys.exit(1)
 
     with open(audio_path, "rb") as f:
         raw = f.read()
 
+    if not raw:
+        print(f"ERROR: audio file is empty: {audio_path}")
+        sys.exit(1)
+
     duration_sec = 0.0
     sample_rate = 0
     channels = 0
-    sample_width = 2
-    header_duration = 0.0
-    size_duration = 0.0
-    try:
-        with wave.open(audio_path, "rb") as wf:
-            sample_rate = wf.getframerate()
-            channels = wf.getnchannels()
-            sample_width = wf.getsampwidth()
-            frames = wf.getnframes()
-            header_duration = frames / float(sample_rate) if sample_rate else 0.0
-            pcm_bytes = max(len(raw) - 44, 0)
-            size_duration = _duration_from_pcm_bytes(
-                pcm_bytes, sample_rate, channels, sample_width
-            )
-            header_ok = (
-                0 < header_duration <= MAX_REASONABLE_AUDIO_SECONDS
-                and size_duration > 0
-                and abs(header_duration - size_duration) / size_duration < 0.25
-            )
-            duration_sec = header_duration if header_ok else size_duration
-    except wave.Error:
-        sample_rate = 16000
-        channels = 1
-        sample_width = 2
-        duration_sec = max(len(raw) / (sample_rate * channels * sample_width), 0.001)
+    media_format = ""
+    codec = ""
+    duration_source = ""
+
+    if _is_riff_wave(raw):
+        try:
+            with wave.open(audio_path, "rb") as wf:
+                sample_rate = wf.getframerate()
+                channels = wf.getnchannels()
+                frames = wf.getnframes()
+                header_duration = frames / float(sample_rate) if sample_rate else 0.0
+                if 0 < header_duration <= MAX_REASONABLE_AUDIO_SECONDS:
+                    duration_sec = header_duration
+                    media_format = "wav"
+                    codec = "pcm"
+                    duration_source = "wav_header"
+                else:
+                    print(
+                        f"WARNING: WAV header duration looks abnormal ({header_duration:.2f}s); trying ffprobe."
+                    )
+        except wave.Error as exc:
+            print(f"WARNING: failed to parse RIFF/WAV header ({exc}); trying ffprobe.")
+    else:
+        print("WARNING: file content is not RIFF/WAV; trying ffprobe for real media duration.")
 
     if duration_sec <= 0:
-        duration_sec = 0.001
-
-    if header_duration > MAX_REASONABLE_AUDIO_SECONDS and size_duration > 0:
-        print(
-            f"  ⚠️ WAV 头时长异常 ({header_duration:.1f}s)，已按文件大小估算为 {duration_sec:.2f}s"
-        )
+        probe = _probe_audio_with_ffprobe(audio_path)
+        if not probe:
+            _abort_untrusted_audio_duration(
+                audio_path,
+                "not a reliable PCM WAV and ffprobe could not read media duration",
+            )
+        duration_sec = float(probe["duration_sec"])
+        sample_rate = sample_rate or int(probe.get("sample_rate") or 0)
+        channels = channels or int(probe.get("channels") or 0)
+        media_format = str(probe.get("media_format") or media_format)
+        codec = str(probe.get("codec") or codec)
+        duration_source = str(probe.get("duration_source") or duration_source)
 
     return AudioMeta(
         path=audio_path,
@@ -286,10 +444,15 @@ def load_audio_meta(audio_path: str) -> AudioMeta:
         sample_rate=sample_rate,
         channels=channels,
         b64_data=base64.b64encode(raw).decode("utf-8"),
+        media_format=media_format,
+        codec=codec,
+        duration_source=duration_source,
     )
 
 
-def load_reference_text(reference_file: Optional[str], inline_text: Optional[str]) -> Optional[str]:
+def load_reference_text(
+    reference_file: Optional[str], inline_text: Optional[str], audio_path: str
+) -> Optional[str]:
     """
     读取 CER/WER 参考文本。
     inline_text 保留向后兼容；日常使用推荐维护 reference_file，无需在命令行传长文本。
@@ -297,10 +460,10 @@ def load_reference_text(reference_file: Optional[str], inline_text: Optional[str
     if inline_text and inline_text.strip():
         return inline_text.strip()
 
-    if not reference_file:
+    path = resolve_reference_path(reference_file, audio_path)
+    if not path:
         return None
 
-    path = reference_file if os.path.isabs(reference_file) else os.path.join(PROJECT_ROOT, reference_file)
     if not os.path.exists(path):
         print(f"  ⚠️ 参考文本文件不存在，CER/WER 将显示 N/A: {path}")
         return None
@@ -315,24 +478,112 @@ def load_reference_text(reference_file: Optional[str], inline_text: Optional[str
     return text
 
 
-def resolve_reference_source(reference_file: Optional[str], inline_text: Optional[str]) -> str:
+def resolve_reference_source(
+    reference_file: Optional[str], inline_text: Optional[str], audio_path: str
+) -> str:
     """返回当前参考文本来源，用于启动日志和 JSON 报告。"""
     if inline_text and inline_text.strip():
         return "命令行 --reference-text"
-    if reference_file:
-        return reference_file if os.path.isabs(reference_file) else os.path.join(PROJECT_ROOT, reference_file)
-    return ""
+    return resolve_reference_path(reference_file, audio_path) or ""
 
 
-def build_payload(b64_data: str, model: str = "funasr-iic", hotwords: str = "") -> dict:
-    """构造 POST 请求的 JSON  body，与 FunASR 接口约定一致"""
+def build_data_uri(audio_path: str, b64_data: str) -> str:
+    """把 base64 音频包装成网关示例使用的 Data URI 格式。"""
+    ext = os.path.splitext(audio_path)[1][1:].lower() or "wav"
+    return f"data:audio/{ext};base64,{b64_data}"
+
+
+def build_gateway_auth_headers(app_key: str, secret_key: str, accept: str = "application/json") -> dict[str, str]:
+    """按 AI Gateway 要求生成 x-date 和 authorization 请求头。"""
+    x_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %T GMT")
+    sign_text = f"x-date: {x_date}"
+    signature = base64.b64encode(
+        hmac.new(secret_key.encode("utf-8"), sign_text.encode("utf-8"), sha256).digest()
+    ).decode("utf-8")
     return {
-        "model": model,
+        "x-date": x_date,
+        "authorization": (
+            f'hmac username="{app_key}", algorithm="hmac-sha256", '
+            f'headers="x-date", signature="{signature}"'
+        ),
+        "Content-Type": "application/json",
+        "Accept": accept,
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-cache",
+    }
+
+
+def build_request_headers(ctx: TestRunContext, *, response_stream: Optional[bool] = None) -> dict[str, str]:
+    """构造单次请求头；网关模式下每次请求都重新签名。"""
+    if not ctx.gateway:
+        return {"Content-Type": "application/json", "Accept": "application/json"}
+    accept = "text/event-stream" if response_stream else "application/json"
+    return build_gateway_auth_headers(ctx.app_key, ctx.secret_key, accept=accept)
+
+
+def build_request_payload(
+    ctx: TestRunContext,
+    *,
+    model: Optional[str] = None,
+    response_stream: Optional[bool] = None,
+) -> dict:
+    """构造 POST JSON body，兼容直连 ASR 和 AI Gateway 两种入口。"""
+    effective_model = model or ctx.model
+    input_value = (
+        build_data_uri(ctx.audio.path, ctx.audio.b64_data)
+        if ctx.gateway and ctx.use_data_uri
+        else ctx.audio.b64_data
+    )
+    payload = {
+        "model": effective_model,
         "input_type": "stream",
-        "input": b64_data,
-        "hotwords": hotwords,
+        "input": input_value,
+        "hotwords": ctx.hotwords,
         "language": "zh",
     }
+    if ctx.gateway:
+        payload = {
+            "componentCode": ctx.component_code,
+            "function": ctx.gateway_function or effective_model,
+            **payload,
+            "is_return_timestamp": ctx.is_return_timestamp,
+        }
+    if response_stream is not None and ctx.include_stream_param:
+        payload[ctx.stream_param_name] = bool(response_stream)
+    return payload
+
+
+def parse_response_body(raw: bytes, content_type: str = "") -> Any:
+    """解析 JSON 或 SSE/plain text 响应，便于流式探测也能提取文本。"""
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        return {}
+
+    looks_json = "json" in content_type.lower() or text[:1] in ("{", "[")
+    if looks_json:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+
+    stream_parts: list[Any] = []
+    plain_parts: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("data:"):
+            line = line[5:].strip()
+        if line == "[DONE]":
+            continue
+        try:
+            stream_parts.append(json.loads(line))
+        except json.JSONDecodeError:
+            plain_parts.append(line)
+
+    if stream_parts:
+        return stream_parts
+    return {"text": "\n".join(plain_parts) if plain_parts else text}
 
 
 def extract_text(body: Any) -> str:
@@ -560,6 +811,7 @@ def build_stress_metrics(
 ) -> StressAggMetrics:
     """根据原始请求列表，统计成功率/QPS，并调用 aggregate_asr 填 asr 字段"""
     successes = [r for r in results if r.success]
+    response_latencies = [r.latency_sec for r in results]
     total = len(results)
     success_count = len(successes)
     success_rate = (success_count / total * 100) if total else 0.0
@@ -578,6 +830,9 @@ def build_stress_metrics(
         success_rate=success_rate,
         attempt_qps=total / wall_sec if wall_sec > 0 else 0.0,
         success_qps=success_count / wall_sec if wall_sec > 0 else 0.0,
+        avg_response_latency=statistics.mean(response_latencies) if response_latencies else 0.0,
+        p95_response_latency=percentile(response_latencies, 95) if response_latencies else 0.0,
+        p99_response_latency=percentile(response_latencies, 99) if response_latencies else 0.0,
         error_types=error_types,
         extra=extra or {},
         asr=aggregate_asr(successes, audio_duration, wall_sec),
@@ -612,6 +867,8 @@ def print_stress_metrics(m: StressAggMetrics, *, focus: str = "") -> None:
     print(f"  │ 成功率:       {m.success_rate:.2f}%")
     print(f"  │ 尝试 QPS:     {m.attempt_qps:.3f}")
     print(f"  │ 成功 QPS:     {m.success_qps:.3f}")
+    print(f"  │ 全部请求耗时: 平均 {m.avg_response_latency:.3f}s | "
+          f"P95 {m.p95_response_latency:.3f}s | P99 {m.p99_response_latency:.3f}s")
     if m.error_types:
         err = ", ".join(f"{k}:{v}" for k, v in sorted(m.error_types.items(), key=lambda x: -x[1]))
         print(f"  │ 错误分布:     {err}")
@@ -627,9 +884,9 @@ def print_asr_metrics(a: AsrAggMetrics, audio: AudioMeta, *, sample_text: str = 
     print("\n  ┌─ ASR 专项指标 ─┐")
     print(f"  │ 音频时长:     {audio.duration_sec:.2f}s ({audio.sample_rate}Hz, {audio.channels}ch)")
     realtime_tag = "✓ 实时" if a.avg_rtf < 1 else "✗ 非实时"
-    print(f"  │ 延迟:         平均 {a.avg_latency:.3f}s | P50 {a.p50_latency:.3f}s | "
+    print(f"  │ 成功请求延迟: 平均 {a.avg_latency:.3f}s | P50 {a.p50_latency:.3f}s | "
           f"P95 {a.p95_latency:.3f}s | P99 {a.p99_latency:.3f}s")
-    print(f"  │ TTFB:         平均 {a.avg_ttfb:.3f}s | P95 {a.p95_ttfb:.3f}s")
+    print(f"  │ 成功请求TTFB: 平均 {a.avg_ttfb:.3f}s | P95 {a.p95_ttfb:.3f}s")
     print(f"  │ RTF:          平均 {a.avg_rtf:.3f}x ({realtime_tag}) | P50 {a.p50_rtf:.3f}x | "
           f"P95 {a.p95_rtf:.3f}x | 最大 {a.max_rtf:.3f}x")
     print(f"  │ 实时占比:     {a.realtime_ratio:.1f}% 请求 RTF<1")
@@ -667,6 +924,8 @@ async def send_one_request(
     session: aiohttp.ClientSession,
     ctx: TestRunContext,
     payload: dict,
+    *,
+    response_stream: Optional[bool] = None,
 ) -> RequestResult:
     """
     发送单次 POST 请求到 ASR 服务。
@@ -680,21 +939,32 @@ async def send_one_request(
         async with session.post(
             ctx.url,
             json=payload,
+            headers=build_request_headers(ctx, response_stream=response_stream),
             ssl=SSL_CTX if ctx.use_ssl else False,
             timeout=aiohttp.ClientTimeout(total=ctx.timeout_s),
         ) as resp:
             result.http_status = resp.status
-            # 进入 async with 且拿到 resp 时，响应头已到 → 记 TTFB
-            ttfb = time.perf_counter() - start
-            result.ttfb_sec = ttfb
+            first_body_byte_at: Optional[float] = None
+            chunks: list[bytes] = []
+            async for chunk in resp.content.iter_chunked(8192):
+                if chunk and first_body_byte_at is None:
+                    first_body_byte_at = time.perf_counter()
+                if chunk:
+                    chunks.append(chunk)
+
+            # TTFB 按“响应体首字节”统计；非流式 JSON 通常接近完整响应耗时。
+            result.ttfb_sec = (
+                first_body_byte_at - start if first_body_byte_at is not None else time.perf_counter() - start
+            )
+            raw_body = b"".join(chunks)
 
             if resp.status == 200:
-                body = await resp.json(content_type=None)
+                body = parse_response_body(raw_body, resp.headers.get("Content-Type", ""))
                 result.success = True
                 result.text = extract_text(body)
                 result.text_chars = len(result.text)
             else:
-                body_text = await resp.text()
+                body_text = raw_body.decode("utf-8", errors="replace")
                 result.error = f"HTTP {resp.status}: {body_text[:200]}"
                 result.error_type = f"HTTP_{resp.status}"
 
@@ -762,7 +1032,7 @@ async def _run_workers_for_duration(
         if initial_delay > 0:
             await asyncio.sleep(initial_delay)
         while time.perf_counter() < stop_at:
-            payload = build_payload(ctx.audio.b64_data, model=ctx.model, hotwords=ctx.hotwords)
+            payload = build_request_payload(ctx)
             res = await send_one_request(session, ref_ctx, payload)
             async with lock:
                 results.append(res)
@@ -811,13 +1081,22 @@ async def run_baseline(
                 use_ssl=ctx.use_ssl,
                 reference_text=ctx.reference_text,
                 hotwords=ctx.hotwords,
+                gateway=ctx.gateway,
+                component_code=ctx.component_code,
+                app_key=ctx.app_key,
+                secret_key=ctx.secret_key,
+                gateway_function=ctx.gateway_function,
+                use_data_uri=ctx.use_data_uri,
+                include_stream_param=ctx.include_stream_param,
+                stream_param_name=ctx.stream_param_name,
+                is_return_timestamp=ctx.is_return_timestamp,
             )
             results: list[RequestResult] = []
             print(f"\n  [{model}]")
             model_start = time.perf_counter()
             active_request_sec = 0.0
             for r in range(rounds):
-                payload = build_payload(ctx.audio.b64_data, model=model, hotwords=ctx.hotwords)
+                payload = build_request_payload(model_ctx, model=model)
                 res = await send_one_request(session, model_ctx, payload)
                 active_request_sec += res.latency_sec
                 results.append(res)
@@ -862,9 +1141,9 @@ async def run_ramp(
     all_levels: list[StressAggMetrics] = []
     print(
         f"\n  {'并发':<6} {'总数':<6} {'成功':<6} {'成功率':<8} {'成功QPS':<9} "
-        f"{'P95延迟':<9} {'平均RTF':<9} {'音频吞吐x':<10}"
+        f"{'全部P95':<9} {'成功P95':<9} {'平均RTF':<9} {'音频吞吐x':<10}"
     )
-    print("  " + "-" * 78)
+    print("  " + "-" * 88)
 
     for concurrency in levels:
         t0 = time.perf_counter()
@@ -878,7 +1157,8 @@ async def run_ramp(
         tag = "✓" if stable else "✗"
         print(
             f"  {concurrency:<6} {m.total_requests:<6} {m.success_count:<6} {m.success_rate:<7.1f}% "
-            f"{m.success_qps:<9.3f} {m.asr.p95_latency:<9.3f} {m.asr.avg_rtf:<9.3f} "
+            f"{m.success_qps:<9.3f} {m.p95_response_latency:<9.3f} {m.asr.p95_latency:<9.3f} "
+            f"{m.asr.avg_rtf:<9.3f} "
             f"{m.asr.audio_throughput_x:<10.3f}  {tag}"
         )
         print_combined_result(m, ctx.audio, focus=f"并发={concurrency}")
@@ -964,7 +1244,8 @@ async def run_spike(
         concurrency=spike_concurrency,
     )
     m.extra["尖峰成功率"] = f"{spike_m.success_rate:.1f}%"
-    m.extra["尖峰P95延迟"] = f"{spike_m.asr.p95_latency:.3f}s"
+    m.extra["尖峰全部请求P95延迟"] = f"{spike_m.p95_response_latency:.3f}s"
+    m.extra["尖峰成功请求P95延迟"] = f"{spike_m.asr.p95_latency:.3f}s"
     m.extra["尖峰平均RTF"] = f"{spike_m.asr.avg_rtf:.3f}x"
     print("\n  ── 尖峰测试汇总 ──")
     print_combined_result(m, ctx.audio, focus="全阶段合计")
@@ -986,7 +1267,8 @@ async def run_soak(
         f"长时间浸泡 — {concurrency} 并发 × {duration_sec}s，每 {bucket_sec}s 分桶",
     )
     results: list[RequestResult] = []
-    bucket_lats_by_idx: dict[int, list[float]] = {}
+    bucket_all_lats_by_idx: dict[int, list[float]] = {}
+    bucket_success_lats_by_idx: dict[int, list[float]] = {}
     bucket_success_by_idx: Counter[int] = Counter()
     bucket_total_by_idx: Counter[int] = Counter()
     lock = asyncio.Lock()
@@ -995,22 +1277,17 @@ async def run_soak(
 
     async def worker(session: aiohttp.ClientSession) -> None:
         while time.perf_counter() < stop_at:
-            payload = build_payload(ctx.audio.b64_data, model=ctx.model, hotwords=ctx.hotwords)
-            ref_ctx = TestRunContext(
-                url=ctx.url, audio=ctx.audio, model=ctx.model,
-                timeout_s=ctx.timeout_s, use_ssl=ctx.use_ssl,
-                reference_text=ctx.reference_text,
-                hotwords=ctx.hotwords,
-            )
-            res = await send_one_request(session, ref_ctx, payload)
+            payload = build_request_payload(ctx)
+            res = await send_one_request(session, ctx, payload)
             async with lock:
                 results.append(res)
                 elapsed = max(res.end_ts - start, 0.0)
                 bucket_idx = int(elapsed // bucket_sec) if bucket_sec > 0 else 0
                 bucket_total_by_idx[bucket_idx] += 1
+                bucket_all_lats_by_idx.setdefault(bucket_idx, []).append(res.latency_sec)
                 if res.success:
                     bucket_success_by_idx[bucket_idx] += 1
-                    bucket_lats_by_idx.setdefault(bucket_idx, []).append(res.latency_sec)
+                    bucket_success_lats_by_idx.setdefault(bucket_idx, []).append(res.latency_sec)
 
     connector = aiohttp.TCPConnector(limit=max(concurrency + 5, 10))
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -1024,19 +1301,28 @@ async def run_soak(
         max_bucket_idx = max(expected_last_bucket, wall_last_bucket, seen_last_bucket)
     else:
         max_bucket_idx = 0
-    bucket_latencies: list[tuple[int, float, float, int, int]] = []
+    bucket_latencies: list[tuple[int, float, float, float, float, int, int]] = []
     for idx in range(max_bucket_idx + 1):
-        lats = bucket_lats_by_idx.get(idx, [])
-        if lats:
-            avg_l = statistics.mean(lats)
-            p95_l = percentile(lats, 95)
+        all_lats = bucket_all_lats_by_idx.get(idx, [])
+        success_lats = bucket_success_lats_by_idx.get(idx, [])
+        if all_lats:
+            all_avg_l = statistics.mean(all_lats)
+            all_p95_l = percentile(all_lats, 95)
         else:
-            avg_l = 0.0
-            p95_l = 0.0
+            all_avg_l = 0.0
+            all_p95_l = 0.0
+        if success_lats:
+            success_avg_l = statistics.mean(success_lats)
+            success_p95_l = percentile(success_lats, 95)
+        else:
+            success_avg_l = 0.0
+            success_p95_l = 0.0
         bucket_latencies.append((
             idx,
-            avg_l,
-            p95_l,
+            all_avg_l,
+            all_p95_l,
+            success_avg_l,
+            success_p95_l,
             bucket_success_by_idx[idx],
             bucket_total_by_idx[idx],
         ))
@@ -1044,18 +1330,21 @@ async def run_soak(
         TestKind.SOAK.value, results, wall, ctx.audio.duration_sec, concurrency=concurrency
     )
 
-    non_empty_buckets = [b for b in bucket_latencies if b[3] > 0]
+    non_empty_buckets = [b for b in bucket_latencies if b[6] > 0]
     if len(non_empty_buckets) >= 2:
         first_p95 = non_empty_buckets[0][2]
         last_p95 = non_empty_buckets[-1][2]
         drift = ((last_p95 - first_p95) / first_p95 * 100) if first_p95 > 0 else 0.0
-        m.extra["首桶P95延迟"] = f"{first_p95:.3f}s"
-        m.extra["末桶P95延迟"] = f"{last_p95:.3f}s"
-        m.extra["P95漂移"] = f"{drift:+.1f}%"
+        m.extra["首桶全部请求P95延迟"] = f"{first_p95:.3f}s"
+        m.extra["末桶全部请求P95延迟"] = f"{last_p95:.3f}s"
+        m.extra["全部请求P95漂移"] = f"{drift:+.1f}%"
 
-    print("\n  分桶延迟趋势 (平均 / P95 / 成功 / 总数):")
-    for idx, avg_l, p95_l, success_n, total_n in bucket_latencies:
-        print(f"    桶 {idx + 1:>2}: 平均 {avg_l:.3f}s | P95 {p95_l:.3f}s | {success_n}/{total_n}")
+    print("\n  分桶延迟趋势 (全部平均 / 全部P95 / 成功平均 / 成功P95 / 成功 / 总数):")
+    for idx, all_avg_l, all_p95_l, success_avg_l, success_p95_l, success_n, total_n in bucket_latencies:
+        print(
+            f"    桶 {idx + 1:>2}: 全部平均 {all_avg_l:.3f}s | 全部P95 {all_p95_l:.3f}s | "
+            f"成功平均 {success_avg_l:.3f}s | 成功P95 {success_p95_l:.3f}s | {success_n}/{total_n}"
+        )
     print_combined_result(m, ctx.audio, focus="浸泡稳态")
     return m
 
@@ -1080,7 +1369,8 @@ async def run_fixed_qps(
 
     results: list[RequestResult] = []
     lock = asyncio.Lock()
-    in_flight_sem = asyncio.Semaphore(max_in_flight)
+    in_flight_lock = asyncio.Lock()
+    in_flight = 0
     interval = 1.0 / target_qps  # 两次请求之间的间隔
     start = time.perf_counter()
     stop_at = start + duration_sec
@@ -1088,19 +1378,15 @@ async def run_fixed_qps(
     dropped_by_limit = 0
 
     async def one_shot(session: aiohttp.ClientSession) -> None:
+        nonlocal in_flight
         try:
-            payload = build_payload(ctx.audio.b64_data, model=ctx.model, hotwords=ctx.hotwords)
-            ref_ctx = TestRunContext(
-                url=ctx.url, audio=ctx.audio, model=ctx.model,
-                timeout_s=ctx.timeout_s, use_ssl=ctx.use_ssl,
-                reference_text=ctx.reference_text,
-                hotwords=ctx.hotwords,
-            )
-            res = await send_one_request(session, ref_ctx, payload)
+            payload = build_request_payload(ctx)
+            res = await send_one_request(session, ctx, payload)
             async with lock:
                 results.append(res)
         finally:
-            in_flight_sem.release()
+            async with in_flight_lock:
+                in_flight -= 1
 
     connector = aiohttp.TCPConnector(limit=max(max_in_flight + 5, 20))
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -1109,15 +1395,19 @@ async def run_fixed_qps(
         while time.perf_counter() < stop_at:
             now = time.perf_counter()
             if now >= next_send:
-                if not in_flight_sem.locked():
-                    await in_flight_sem.acquire()
-                    scheduled_count += 1
-                    tasks.append(asyncio.create_task(one_shot(session)))
-                else:
-                    dropped_by_limit += 1
-                next_send += interval
+                while next_send <= now and next_send < stop_at:
+                    async with in_flight_lock:
+                        can_send = in_flight < max_in_flight
+                        if can_send:
+                            in_flight += 1
+                    if can_send:
+                        scheduled_count += 1
+                        tasks.append(asyncio.create_task(one_shot(session)))
+                    else:
+                        dropped_by_limit += 1
+                    next_send += interval
             else:
-                await asyncio.sleep(min(0.001, next_send - now))
+                await asyncio.sleep(next_send - now)
         send_window_end = time.perf_counter()
         if tasks:
             await asyncio.gather(*tasks)
@@ -1188,6 +1478,214 @@ async def run_accuracy_load(
     return m
 
 
+async def run_single_probe(
+    ctx: TestRunContext,
+    *,
+    response_stream: bool,
+    label: str,
+) -> StressAggMetrics:
+    """单请求探测，用于验收流式首字节和非流式完整响应耗时。"""
+    mode = "流式" if response_stream else "非流式"
+    print_test_banner(TestKind.ACCEPTANCE, f"{label} — 单并发{mode}探测")
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=2)) as session:
+        payload = build_request_payload(ctx, response_stream=response_stream)
+        t0 = time.perf_counter()
+        res = await send_one_request(session, ctx, payload, response_stream=response_stream)
+        wall = time.perf_counter() - t0
+    m = build_stress_metrics(
+        TestKind.ACCEPTANCE.value,
+        [res],
+        wall,
+        ctx.audio.duration_sec,
+        concurrency=1,
+        extra={"模式": mode},
+    )
+    sample = res.text if res.success else res.error or ""
+    print_combined_result(m, ctx.audio, focus=label, sample_text=sample)
+    return m
+
+
+async def run_fixed_requests(
+    ctx: TestRunContext,
+    concurrency: int,
+    total_requests: int,
+    *,
+    response_stream: Optional[bool] = None,
+) -> StressAggMetrics:
+    """固定总请求数压测：最多 concurrency 个在途请求，总共只发 total_requests 条。"""
+    print_test_banner(
+        TestKind.FIXED_REQUESTS,
+        f"固定请求数 — {concurrency} 并发 / {total_requests} 请求",
+    )
+    if concurrency <= 0 or total_requests <= 0:
+        print("\n  ⚠️ fixed_requests 参数非法：concurrency、total_requests 必须大于 0")
+        return StressAggMetrics(test_kind=TestKind.FIXED_REQUESTS.value, concurrency=concurrency)
+
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for request_id in range(total_requests):
+        queue.put_nowait(request_id)
+
+    results: list[RequestResult] = []
+    lock = asyncio.Lock()
+    start = time.perf_counter()
+
+    async def worker(session: aiohttp.ClientSession) -> None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                payload = build_request_payload(ctx, response_stream=response_stream)
+                res = await send_one_request(session, ctx, payload, response_stream=response_stream)
+                async with lock:
+                    results.append(res)
+            finally:
+                queue.task_done()
+
+    connector = aiohttp.TCPConnector(limit=max(concurrency + 5, 10))
+    async with aiohttp.ClientSession(connector=connector) as session:
+        workers = [asyncio.create_task(worker(session)) for _ in range(min(concurrency, total_requests))]
+        await asyncio.gather(*workers)
+
+    wall = time.perf_counter() - start
+    m = build_stress_metrics(
+        TestKind.FIXED_REQUESTS.value,
+        results,
+        wall,
+        ctx.audio.duration_sec,
+        concurrency=concurrency,
+        extra={"计划请求数": total_requests},
+    )
+    sample = next((r.text for r in results if r.success and r.text), "")
+    print_combined_result(m, ctx.audio, focus=f"{concurrency}并发/{total_requests}请求", sample_text=sample)
+    return m
+
+
+def _pass_fail(ok: bool) -> str:
+    return "PASS" if ok else "FAIL"
+
+
+def print_acceptance_summary(
+    *,
+    audio: AudioMeta,
+    stream_probe: Optional[StressAggMetrics],
+    non_stream_probe: Optional[StressAggMetrics],
+    fixed_8x10: StressAggMetrics,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """打印并返回本次音频验收指标判定。"""
+    stream_ttfb = stream_probe.asr.avg_ttfb if stream_probe and stream_probe.success_count else None
+    non_stream_latency = (
+        non_stream_probe.asr.avg_latency if non_stream_probe and non_stream_probe.success_count else None
+    )
+    rtf_source = stream_probe or non_stream_probe
+    single_rtf = rtf_source.asr.avg_rtf if rtf_source and rtf_source.success_count else None
+    success_p95_latency = fixed_8x10.asr.p95_latency if fixed_8x10.success_count else None
+    all_p95_latency = fixed_8x10.p95_response_latency if fixed_8x10.total_requests else None
+    stable_ok = (
+        fixed_8x10.concurrency >= args.metric_stable_concurrency
+        and fixed_8x10.total_requests >= args.metric_total_requests
+        and fixed_8x10.success_count > 0
+    )
+    success_ok = fixed_8x10.success_rate >= args.metric_success_rate
+    success_p95_ok = success_p95_latency is not None and success_p95_latency <= args.metric_p95_latency
+    all_p95_ok = all_p95_latency is not None and all_p95_latency <= args.metric_p95_latency
+
+    checks = [
+        {
+            "name": "当前音频 单并发流式 TTFB",
+            "threshold": f"<= {args.metric_stream_ttfb:.2f}s",
+            "value": None if stream_ttfb is None else round(stream_ttfb, 3),
+            "pass": stream_ttfb is not None and stream_ttfb <= args.metric_stream_ttfb,
+        },
+        {
+            "name": "当前音频 单并发非流式完整响应",
+            "threshold": f"<= {args.metric_non_stream_latency:.2f}s",
+            "value": None if non_stream_latency is None else round(non_stream_latency, 3),
+            "pass": non_stream_latency is not None and non_stream_latency <= args.metric_non_stream_latency,
+        },
+        {
+            "name": "当前音频 单并发 RTF",
+            "threshold": f"<= {args.metric_rtf:.2f}",
+            "value": None if single_rtf is None else round(single_rtf, 3),
+            "pass": single_rtf is not None and single_rtf <= args.metric_rtf,
+        },
+        {
+            "name": "当前音频 稳定并发数",
+            "threshold": f">= {args.metric_stable_concurrency}",
+            "value": fixed_8x10.concurrency,
+            "pass": stable_ok and success_ok and all_p95_ok,
+        },
+        {
+            "name": f"当前音频 {args.metric_concurrency}并发{args.metric_total_requests}请求成功率",
+            "threshold": f">= {args.metric_success_rate:.2f}%",
+            "value": round(fixed_8x10.success_rate, 3),
+            "pass": success_ok,
+        },
+        {
+            "name": f"当前音频 {args.metric_concurrency}并发{args.metric_total_requests}成功请求P95响应耗时",
+            "threshold": f"<= {args.metric_p95_latency:.2f}s",
+            "value": None if success_p95_latency is None else round(success_p95_latency, 3),
+            "pass": success_p95_ok,
+        },
+        {
+            "name": f"当前音频 {args.metric_concurrency}并发{args.metric_total_requests}全部请求P95响应耗时",
+            "threshold": f"<= {args.metric_p95_latency:.2f}s",
+            "value": None if all_p95_latency is None else round(all_p95_latency, 3),
+            "pass": all_p95_ok,
+        },
+    ]
+
+    print("\n" + "=" * 92)
+    print("【验收指标汇总】")
+    print("=" * 92)
+    print(
+        f"  音频: {audio.path} | {audio.duration_sec:.2f}s | "
+        f"{audio.sample_rate}Hz | {audio.channels}ch | {audio.file_kb}KB"
+    )
+    for item in checks:
+        value = "N/A" if item["value"] is None else item["value"]
+        print(f"  {_pass_fail(item['pass']):<4} {item['name']:<28} {value!s:<10} {item['threshold']}")
+    if not args.include_stream_param:
+        print("\n  说明: 当前未启用 --include-stream-param，流式/非流式探测不会向 payload 写入 stream=True/False。")
+    print("=" * 92)
+
+    return {
+        "checks": checks,
+        "passed": all(item["pass"] for item in checks),
+    }
+
+
+async def run_acceptance(ctx: TestRunContext, args: argparse.Namespace) -> dict[str, Any]:
+    """一键执行用户关心的 ASR 验收指标。"""
+    stream_probe = None
+    non_stream_probe = None
+    if not args.skip_metric_probes:
+        stream_probe = await run_single_probe(ctx, response_stream=True, label="metric_stream_single")
+        non_stream_probe = await run_single_probe(ctx, response_stream=False, label="metric_non_stream_single")
+
+    fixed_8x10 = await run_fixed_requests(
+        ctx,
+        args.metric_concurrency,
+        args.metric_total_requests,
+        response_stream=args.metric_stream_concurrency,
+    )
+    summary = print_acceptance_summary(
+        audio=ctx.audio,
+        stream_probe=stream_probe,
+        non_stream_probe=non_stream_probe,
+        fixed_8x10=fixed_8x10,
+        args=args,
+    )
+    return {
+        "stream_single": _metrics_to_dict(stream_probe) if stream_probe else None,
+        "non_stream_single": _metrics_to_dict(non_stream_probe) if non_stream_probe else None,
+        "fixed_concurrency": _metrics_to_dict(fixed_8x10),
+        "summary": summary,
+    }
+
+
 # ==================== 总汇总（全部跑完后的一页纸结论） ====================
 
 
@@ -1212,7 +1710,7 @@ def print_final_summary(
             a = m.get("asr", {})
             cer = _fmt_pct_opt(a.get("avg_cer") if isinstance(a, dict) else None)
             print(
-                f"    {model}: 延迟 {a.get('avg_latency', 0):.3f}s | RTF {a.get('avg_rtf', 0):.3f}x | "
+                f"    {model}: 成功延迟 {a.get('avg_latency', 0):.3f}s | RTF {a.get('avg_rtf', 0):.3f}x | "
                 f"CER {cer} | 成功率 {m.get('success_rate', 0):.1f}%"
             )
 
@@ -1234,7 +1732,7 @@ def print_final_summary(
             print(f"\n  递增并发: 最大稳定并发 ≈ {bc} (成功率≥{stop_success_rate:.0f}%)")
             print(f"  峰值成功 QPS: {best_qps:.3f}")
 
-    for key in ("sustained", "spike", "soak", "fixed_qps", "accuracy_load"):
+    for key in ("sustained", "spike", "soak", "fixed_qps", "accuracy_load", "fixed_requests"):
         entry = report.get(key)
         if not entry:
             continue
@@ -1244,8 +1742,15 @@ def print_final_summary(
             print(
                 f"\n  {key}: 成功率 {entry['success_rate']:.1f}% | "
                 f"成功QPS {entry['success_qps']:.3f} | "
-                f"P95延迟 {a.get('p95_latency', 0) if isinstance(a, dict) else 0:.3f}s | CER {cer}"
+                f"全部P95 {entry.get('p95_response_latency', 0):.3f}s | "
+                f"成功P95 {a.get('p95_latency', 0) if isinstance(a, dict) else 0:.3f}s | CER {cer}"
             )
+
+    acceptance = report.get("acceptance")
+    if isinstance(acceptance, dict):
+        summary = acceptance.get("summary", {})
+        if isinstance(summary, dict):
+            print(f"\n  acceptance: {'PASS' if summary.get('passed') else 'FAIL'}")
 
     print("\n" + "=" * 92)
 
@@ -1265,8 +1770,8 @@ async def run(args: argparse.Namespace) -> None:
     audio = load_audio_meta(args.audio)
     use_ssl = args.url.lower().startswith("https")
     tests = parse_tests(args.tests)
-    reference_text = load_reference_text(args.reference_file, args.reference_text)
-    reference_source = resolve_reference_source(args.reference_file, args.reference_text)
+    reference_text = load_reference_text(args.reference_file, args.reference_text, audio.path)
+    reference_source = resolve_reference_source(args.reference_file, args.reference_text, audio.path)
 
     ctx = TestRunContext(
         url=args.url,
@@ -1276,12 +1781,24 @@ async def run(args: argparse.Namespace) -> None:
         use_ssl=use_ssl,
         reference_text=reference_text,
         hotwords=args.hotwords,
+        gateway=args.gateway,
+        component_code=args.component_code,
+        app_key=args.app_key,
+        secret_key=args.secret_key,
+        gateway_function=args.gateway_function or "",
+        use_data_uri=args.use_data_uri,
+        include_stream_param=args.include_stream_param,
+        stream_param_name=args.stream_param_name,
+        is_return_timestamp=args.timestamp,
     )
 
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ASR 压力测试全集启动")
     print(f"  目标:     {args.url}")
     print(f"  音频:     {audio.path} ({audio.duration_sec:.2f}s, {audio.file_kb}KB)")
     print(f"  压测模型: {ctx.model}")
+    print(f"  调用模式: {'AI Gateway' if ctx.gateway else 'Direct ASR'}")
+    if ctx.gateway:
+        print(f"  组件编码: {ctx.component_code} | function: {ctx.gateway_function or ctx.model}")
     print(f"  测试项:   {', '.join(tests)}")
     if reference_text:
         print(f"  参考来源: {reference_source}")
@@ -1294,6 +1811,11 @@ async def run(args: argparse.Namespace) -> None:
         "audio": {
             "path": audio.path,
             "duration_sec": round(audio.duration_sec, 3),
+            "sample_rate": audio.sample_rate,
+            "channels": audio.channels,
+            "codec": audio.codec,
+            "media_format": audio.media_format,
+            "duration_source": audio.duration_source,
             "file_kb": audio.file_kb,
             "b64_kb": audio.b64_kb,
         },
@@ -1301,8 +1823,13 @@ async def run(args: argparse.Namespace) -> None:
             "url": args.url,
             "model": ctx.model,
             "tests": tests,
-            "reference_file": args.reference_file,
+            "reference_file": reference_source,
             "reference_source": reference_source,
+            "gateway": ctx.gateway,
+            "component_code": ctx.component_code if ctx.gateway else "",
+            "gateway_function": (ctx.gateway_function or ctx.model) if ctx.gateway else "",
+            "include_stream_param": ctx.include_stream_param,
+            "stream_param_name": ctx.stream_param_name,
         },
     }
 
@@ -1357,6 +1884,18 @@ async def run(args: argparse.Namespace) -> None:
         )
         report["accuracy_load"] = _metrics_to_dict(m)
 
+    if TestKind.FIXED_REQUESTS.value in tests:
+        m = await run_fixed_requests(
+            ctx,
+            args.fixed_requests_concurrency,
+            args.fixed_requests_total,
+            response_stream=args.fixed_requests_stream,
+        )
+        report["fixed_requests"] = _metrics_to_dict(m)
+
+    if TestKind.ACCEPTANCE.value in tests:
+        report["acceptance"] = await run_acceptance(ctx, args)
+
     print_final_summary(audio, report, args.stop_success_rate)
 
     if args.output:
@@ -1378,16 +1917,69 @@ def parse_tests(raw: str) -> list[str]:
     if invalid:
         print(f"❌ 未知测试类型: {invalid}，可选: {', '.join(ALL_TEST_NAMES)}")
         sys.exit(1)
+    if not names:
+        print(f"❌ --tests 不能为空，可选: {', '.join(ALL_TEST_NAMES)} 或 all")
+        sys.exit(1)
     return names
+
+
+def validate_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Fail fast for invalid load-test settings before opening network sessions."""
+    if not args.models:
+        parser.error("--models 至少需要 1 个模型名")
+
+    if any(value <= 0 for value in args.concurrency):
+        parser.error("--concurrency 只能包含正整数")
+
+    positive_int_fields = (
+        "duration",
+        "rounds",
+        "sustained_concurrency",
+        "sustained_duration",
+        "spike_low",
+        "spike_high",
+        "spike_low_sec",
+        "spike_high_sec",
+        "spike_recovery_sec",
+        "soak_concurrency",
+        "soak_duration",
+        "soak_bucket_sec",
+        "fixed_qps_duration",
+        "max_in_flight",
+        "accuracy_concurrency",
+        "accuracy_duration",
+        "fixed_requests_concurrency",
+        "fixed_requests_total",
+        "metric_concurrency",
+        "metric_total_requests",
+        "metric_stable_concurrency",
+    )
+    for field_name in positive_int_fields:
+        if getattr(args, field_name) <= 0:
+            parser.error(f"--{field_name.replace('_', '-')} 必须大于 0")
+
+    if args.timeout <= 0:
+        parser.error("--timeout 必须大于 0")
+    if args.target_qps <= 0:
+        parser.error("--target-qps 必须大于 0")
+    if not 0 < args.stop_success_rate <= 100:
+        parser.error("--stop-success-rate 必须在 0 到 100 之间")
+    if not 0 < args.metric_success_rate <= 100:
+        parser.error("--metric-success-rate 必须在 0 到 100 之间")
+    for field_name in ("metric_stream_ttfb", "metric_non_stream_latency", "metric_rtf", "metric_p95_latency"):
+        if getattr(args, field_name) <= 0:
+            parser.error(f"--{field_name.replace('_', '-')} 必须大于 0")
+    if args.gateway and (not args.app_key or not args.secret_key or not args.component_code):
+        parser.error("--gateway 模式必须提供 --app-key、--secret-key、--component-code")
 
 
 def main() -> None:
     """命令行入口：定义所有参数，最后 asyncio.run(run(args)) 启动异步主流程"""
     parser = argparse.ArgumentParser(
         description="FunASR ASR 压力测试全集 (压力指标 + ASR 专项指标)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=LoadTestHelpFormatter,
     )
-    parser.add_argument("--url", default=DEFAULT_API_URL)
+    parser.add_argument("--url", default=DEFAULT_GATEWAY_URL, help="AI Gateway /predict 地址")
     parser.add_argument("--audio", default=DEFAULT_AUDIO)
     parser.add_argument("--models", nargs="+", default=["funasr-iic", "funasr-nano"])
     parser.add_argument("--stress-model", default=None, help="除 baseline 外压测使用的模型")
@@ -1397,9 +1989,32 @@ def main() -> None:
         default="all",
         help=f"逗号分隔或 all。可选: {', '.join(ALL_TEST_NAMES)}",
     )
-    parser.add_argument("--reference-file", default=DEFAULT_REFERENCE_TEXT, help="参考文本文件 (CER/WER/accuracy_load)")
+    parser.add_argument(
+        "--reference-file",
+        default=None,
+        help=(
+            "参考文本文件 (CER/WER/accuracy_load)；默认读取音频同目录下的 "
+            f"{REFERENCE_TEXT_FILENAME}"
+        ),
+    )
     parser.add_argument("--reference-text", default=None, help="参考文本字符串；如提供则覆盖 --reference-file")
     parser.add_argument("--output", default=None, help="JSON 报告路径")
+
+    # ---------- AI Gateway 统一入口 ----------
+    gateway_group = parser.add_mutually_exclusive_group()
+    gateway_group.add_argument("--gateway", dest="gateway", action="store_true", default=argparse.SUPPRESS, help="使用 AI Gateway /predict 入口和 HMAC 鉴权")
+    gateway_group.add_argument("--direct", dest="gateway", action="store_false", default=argparse.SUPPRESS, help="使用直连 ASR 接口，不加 AI Gateway 鉴权")
+    parser.set_defaults(gateway=True)
+    parser.add_argument("--app-key", default=DEFAULT_GATEWAY_APP_KEY, help="网关客户编码 / app key")
+    parser.add_argument("--secret-key", default=DEFAULT_GATEWAY_SECRET_KEY, help="网关签名密钥")
+    parser.add_argument("--component-code", default=DEFAULT_GATEWAY_COMPONENT_CODE, help="网关 componentCode")
+    parser.add_argument("--gateway-function", default=None, help="网关 function 字段；不传则跟随当前 model")
+    parser.add_argument("--timestamp", action="store_true", help="请求返回时间戳")
+    parser.add_argument("--use-data-uri", dest="use_data_uri", action="store_true", default=argparse.SUPPRESS, help="网关模式下 input 使用 data:audio/...;base64,...")
+    parser.add_argument("--raw-base64", dest="use_data_uri", action="store_false", default=argparse.SUPPRESS, help="网关模式下 input 仅传 base64")
+    parser.set_defaults(use_data_uri=True)
+    parser.add_argument("--include-stream-param", action="store_true", help="payload 中写入 stream=True/False，用于支持响应流式切换的后端")
+    parser.add_argument("--stream-param-name", default="stream", help="响应流式开关字段名")
 
     # ---------- ramp 递增并发相关参数 ----------
     parser.add_argument("--concurrency", nargs="+", type=int, default=[1, 2, 4, 8, 10, 12,16, 32])
@@ -1433,7 +2048,25 @@ def main() -> None:
     parser.add_argument("--accuracy-concurrency", type=int, default=8)
     parser.add_argument("--accuracy-duration", type=int, default=45)
 
+    # ---------- fixed_requests 固定请求数 ----------
+    parser.add_argument("--fixed-requests-concurrency", type=int, default=8)
+    parser.add_argument("--fixed-requests-total", type=int, default=10)
+    parser.add_argument("--fixed-requests-stream", action="store_true", help="fixed_requests 场景使用 stream=True")
+
+    # ---------- acceptance 验收指标 ----------
+    parser.add_argument("--metric-stream-ttfb", type=float, default=30.0, help="单并发流式 TTFB 阈值，秒")
+    parser.add_argument("--metric-non-stream-latency", type=float, default=60.0, help="单并发非流式完整响应阈值，秒")
+    parser.add_argument("--metric-rtf", type=float, default=1.0, help="单并发 RTF 阈值")
+    parser.add_argument("--metric-stable-concurrency", type=int, default=8, help="稳定并发数阈值")
+    parser.add_argument("--metric-concurrency", type=int, default=8, help="验收并发请求场景的并发数")
+    parser.add_argument("--metric-total-requests", type=int, default=10, help="验收并发请求场景的总请求数")
+    parser.add_argument("--metric-success-rate", type=float, default=90.0, help="验收并发请求成功率下限，百分比")
+    parser.add_argument("--metric-p95-latency", type=float, default=300.0, help="验收并发请求 P95 响应耗时阈值，秒")
+    parser.add_argument("--metric-stream-concurrency", action="store_true", help="验收并发请求场景使用 stream=True")
+    parser.add_argument("--skip-metric-probes", action="store_true", help="跳过单请求流式/非流式探测，只跑并发验收")
+
     args = parser.parse_args()
+    validate_args(args, parser)
     asyncio.run(run(args))
 
 
