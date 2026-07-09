@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import csv
 import glob
+import hmac
 import json
 import math
 import os
@@ -17,7 +19,8 @@ import traceback
 import wave
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Optional
 
@@ -27,10 +30,22 @@ from requests.adapters import HTTPAdapter
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-URL = "http://36.111.82.53:10015/api/tts/instruct2"
-DEFAULT_CONCURRENT_LEVELS = [1, 2, 4, 8, 16, 32]
-DEFAULT_OUTPUT_DIR = "tts_output"
+# 网关默认值：与 gateway_tts/tts_api_npu_gateway.py 的南网网关调用方式保持一致。
+# 密钥类参数优先从环境变量读取，便于不同环境切换，不需要反复修改源码。
+URL = "https://10.10.65.213:18300/ai-inference-gateway/predict"
+DEFAULT_GATEWAY_APP_KEY = os.getenv("TTS_GATEWAY_APP_KEY", os.getenv("TTS_CUSTCODE", "1001300033"))
+DEFAULT_GATEWAY_SECRET_KEY = os.getenv(
+    "TTS_GATEWAY_SECRET_KEY",
+    os.getenv("TTS_BINDING_API_KEY", "24e74daf74124b0b96c9cb113162a976"),
+)
+DEFAULT_GATEWAY_COMPONENT_CODE = os.getenv("TTS_GATEWAY_COMPONENT_CODE", os.getenv("TTS_COMPONENTCODE", "04100945"))
+DEFAULT_GATEWAY_MODEL = os.getenv("TTS_GATEWAY_MODEL", "tts-v1")
 
+# 阶梯压测默认并发级别；如需指定单个并发或自定义阶梯，可使用命令行参数覆盖。
+DEFAULT_CONCURRENT_LEVELS = [1,2,4,8,12,16,20,22,24,26,28,30,32,34,36,38,40]
+DEFAULT_OUTPUT_DIR = "../test_tts/tts_output"
+
+# WAV 校验和音频时长估算使用的默认格式，TTS 服务通常返回 24kHz/单声道/16bit PCM WAV。
 DEFAULT_AUDIO_SAMPLE_RATE = 24000
 DEFAULT_AUDIO_CHANNELS = 1
 DEFAULT_AUDIO_SAMPLE_WIDTH = 2
@@ -47,7 +62,7 @@ SESSION_LOCAL = threading.local()
 def graceful_exit(signum: Optional[int] = None, frame: object = None) -> None:
     global RUNNING
     RUNNING = False
-    print("\n[STOP] 收到退出信号：当前 burst 会尽量完成，后续阶梯将停止。\n")
+    print("\n[STOP] 收到退出信号：当前同步批次会尽量完成，后续阶梯将停止。\n")
 
 
 signal.signal(signal.SIGINT, graceful_exit)
@@ -60,6 +75,10 @@ class TTSResponseError(Exception):
 
 @dataclass
 class RequestResult:
+    """单个 TTS 请求的原始结果。
+
+    这里保留毫秒级耗时、HTTP 状态、音频时长和输出路径，后续阶梯统计全部基于这些原始样本计算。
+    """
     concurrency: int
     model_pool_size: int
     request_id: int
@@ -99,6 +118,11 @@ class WavFormatInfo:
 
 @dataclass
 class StepResult:
+    """单个并发阶梯的汇总指标。
+
+    有效活跃耗时按每轮同步批次从释放到全部完成的窗口累计，避免把批次间隔等待时间算入 QPS；
+    首尾窗口耗时则覆盖本阶梯第一笔请求开始到最后一笔请求结束，用来观察真实压测墙钟窗口。
+    """
     concurrency: int
     model_pool_size: int
     burst_rounds: int
@@ -296,6 +320,92 @@ def get_session(pool_size: int) -> requests.Session:
         SESSION_LOCAL.session = create_session(pool_size)
         SESSION_LOCAL.pool_size = pool_size
     return SESSION_LOCAL.session
+
+
+def build_gateway_auth_headers(app_key: str, secret_key: str, accept: str) -> dict[str, str]:
+    """按网关要求生成 x-date 和 authorization 请求头。
+
+    签名口径与 curl 示例保持一致：对字符串 "x-date: <GMT 时间>" 做 HMAC-SHA256，
+    再进行 Base64 编码，最终放入 authorization 的 signature 字段。
+    """
+    x_date = datetime.now(timezone.utc).strftime("%a, %d %b %Y %T GMT")
+    sign_text = f"x-date: {x_date}"
+    signature = base64.b64encode(
+        hmac.new(secret_key.encode("utf-8"), sign_text.encode("utf-8"), sha256).digest()
+    ).decode("utf-8")
+    return {
+        "x-date": x_date,
+        "authorization": (
+            f'hmac username="{app_key}", algorithm="hmac-sha256", '
+            f'headers="x-date", signature="{signature}"'
+        ),
+        "Content-Type": "application/json",
+        "Accept": accept,
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-cache",
+    }
+
+
+def decode_base64_audio(value: str) -> Optional[bytes]:
+    """从 JSON 字符串字段中尝试提取 base64 音频内容。"""
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.startswith("data:") and "," in candidate:
+        candidate = candidate.split(",", 1)[1]
+    if len(candidate) < 32:
+        return None
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except Exception:
+        return None
+    return decoded if len(decoded) >= 32 else None
+
+
+def extract_audio_from_json(value: object) -> Optional[bytes]:
+    """兼容网关 JSON 响应中常见的音频字段名，递归查找 base64/WAV 内容。"""
+    if isinstance(value, str):
+        return decode_base64_audio(value)
+    if isinstance(value, list):
+        if value and all(isinstance(item, int) and 0 <= item <= 255 for item in value):
+            return bytes(value)
+        chunks = [extract_audio_from_json(item) for item in value]
+        chunks = [item for item in chunks if item]
+        if not chunks:
+            return None
+        riff_chunks = [item for item in chunks if item.startswith(b"RIFF")]
+        return riff_chunks[0] if riff_chunks else b"".join(chunks)
+    if isinstance(value, dict):
+        priority_keys = (
+            "audio",
+            "audio_data",
+            "audioContent",
+            "audio_content",
+            "wav",
+            "content",
+            "data",
+            "result",
+            "response",
+            "output",
+        )
+        for key in priority_keys:
+            if key in value:
+                extracted = extract_audio_from_json(value[key])
+                if extracted:
+                    return extracted
+        for nested in value.values():
+            extracted = extract_audio_from_json(nested)
+            if extracted:
+                return extracted
+    return None
+
+
+def describe_json_shape(value: object) -> str:
+    if isinstance(value, dict):
+        return "keys=" + ",".join(str(key) for key in list(value.keys())[:20])
+    if isinstance(value, list):
+        return f"list_len={len(value)}"
+    return type(value).__name__
 
 
 def percentile(values: list[float], pct: float, method: str = "nearest_rank") -> Optional[float]:
@@ -537,10 +647,13 @@ class TTSLadderTester:
         return self.current_text or self.refresh_step_text()
 
     def make_payload(self, text: str) -> dict[str, object]:
+        # 网关统一入口参数：model 用于网关侧模型路由，function 用于 TTS 服务内部子功能分发。
+        # zero_shot 场景使用 input_text/prompt_text/speaker_id；instruct2 额外补 instruct_text。
         tts_params = {
-            "instruct_text": self.args.instruct_text,
+            "input_text": text,
+            "prompt_text": self.args.prompt_text,
+            "speaker_id": self.args.speaker_id or self.args.zero_shot_spk_id,
             "prompt_audio": self.args.prompt_audio,
-            "zero_shot_spk_id": self.args.zero_shot_spk_id,
             "speed": self.args.speed,
             "stream": self.args.stream,
             "background_audio": self.args.background_audio,
@@ -550,9 +663,103 @@ class TTSLadderTester:
             "seed": self.args.seed,
             "split": self.args.split,
             "res_content": self.args.res_content,
-            "text": text,
+            "response_format": self.args.response_format,
         }
-        return {"model": self.args.model, "tts_params": tts_params}
+        if self.args.function == "instruct2":
+            tts_params["instruct_text"] = self.args.instruct_text
+        return {
+            "componentCode": self.args.component_code,
+            "model": self.args.model,
+            "function": self.args.function,
+            "tts_params": tts_params,
+        }
+
+    def make_headers(self) -> dict[str, str]:
+        # 网关流式 WAV 一般使用 application/octet-stream；JSON 模式保留 application/json。
+        accept = "application/json" if self.args.response_format == "json" else "application/octet-stream"
+        return build_gateway_auth_headers(self.args.app_key, self.args.secret_key, accept)
+
+    def read_audio_stream_response(
+        self,
+        response: requests.Response,
+        save_path: Path,
+        start_perf: float,
+    ) -> tuple[Optional[float], Optional[float], int, int]:
+        """读取网关或直连接口直接返回的 WAV/二进制音频流。"""
+        output_bytes = 0
+        response_bytes = 0
+        first_byte_ms: Optional[float] = None
+        first_audio_ms: Optional[float] = None
+        last_chunk_perf = time.perf_counter()
+        prefix_buffer = bytearray()
+        wav_info = WavFormatInfo()
+
+        with save_path.open("wb") as file:
+            for chunk in response.iter_content(chunk_size=self.args.chunk_size):
+                now_perf = time.perf_counter()
+                if now_perf - last_chunk_perf > self.args.chunk_timeout:
+                    raise TTSResponseError(f"Stream chunk timeout: no data for {self.args.chunk_timeout:.2f}s")
+                if not chunk:
+                    continue
+                if first_byte_ms is None:
+                    first_byte_ms = (now_perf - start_perf) * 1000
+                last_chunk_perf = now_perf
+                received_after = output_bytes + len(chunk)
+                if len(prefix_buffer) < MAX_WAV_PREFIX_BYTES:
+                    prefix_room = MAX_WAV_PREFIX_BYTES - len(prefix_buffer)
+                    prefix_buffer.extend(chunk[:prefix_room])
+                    wav_info = parse_wav_format_prefix(bytes(prefix_buffer))
+                if first_audio_ms is None:
+                    if wav_info.data_offset is not None and received_after > wav_info.data_offset:
+                        first_audio_ms = (now_perf - start_perf) * 1000
+                    elif not self.args.require_wav:
+                        first_audio_ms = (now_perf - start_perf) * 1000
+                file.write(chunk)
+                output_bytes += len(chunk)
+                response_bytes += len(chunk)
+
+        return first_byte_ms, first_audio_ms, output_bytes, response_bytes
+
+    def read_json_audio_response(
+        self,
+        response: requests.Response,
+        save_path: Path,
+        start_perf: float,
+    ) -> tuple[Optional[float], Optional[float], int, int]:
+        """读取 response_format=json 的网关响应，并把其中的音频内容落盘为 WAV。"""
+        chunks: list[bytes] = []
+        response_bytes = 0
+        first_byte_ms: Optional[float] = None
+        last_chunk_perf = time.perf_counter()
+
+        for chunk in response.iter_content(chunk_size=self.args.chunk_size):
+            now_perf = time.perf_counter()
+            if now_perf - last_chunk_perf > self.args.chunk_timeout:
+                raise TTSResponseError(f"JSON chunk timeout: no data for {self.args.chunk_timeout:.2f}s")
+            if not chunk:
+                continue
+            if first_byte_ms is None:
+                first_byte_ms = (now_perf - start_perf) * 1000
+            last_chunk_perf = now_perf
+            chunks.append(chunk)
+            response_bytes += len(chunk)
+
+        body = b"".join(chunks)
+        if body.startswith(b"RIFF") and body[8:12] == b"WAVE":
+            save_path.write_bytes(body)
+            return first_byte_ms, first_byte_ms, len(body), response_bytes
+
+        try:
+            json_body = json.loads(body.decode(response.encoding or "utf-8"))
+        except Exception as exc:
+            snippet = body[:500].decode("utf-8", errors="replace")
+            raise TTSResponseError(f"Invalid JSON response: {exc}; body={snippet}") from exc
+
+        audio_bytes = extract_audio_from_json(json_body)
+        if not audio_bytes:
+            raise TTSResponseError(f"JSON response does not contain base64 audio: {describe_json_shape(json_body)}")
+        save_path.write_bytes(audio_bytes)
+        return first_byte_ms, first_byte_ms, len(audio_bytes), response_bytes
 
     def send_request(
         self,
@@ -611,7 +818,7 @@ class TTSLadderTester:
 
             inflight.enter()
             entered_inflight = True
-            headers = {"accept": "application/json", "Content-Type": "application/json"}
+            headers = self.make_headers()
             socket_read_timeout = min(self.args.read_timeout, self.args.chunk_timeout)
             http_started = True
             http_start_perf = time.perf_counter()
@@ -632,35 +839,20 @@ class TTSLadderTester:
             save_path = self.output_dir / (
                 f"tts_c{concurrency}_b{burst_id}_r{request_id}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.wav"
             )
-            first_byte_ms: Optional[float] = None
-            first_audio_ms: Optional[float] = None
-            last_chunk_perf = time.perf_counter()
-            prefix_buffer = bytearray()
-            wav_info = WavFormatInfo()
-
-            with save_path.open("wb") as file:
-                for chunk in response.iter_content(chunk_size=self.args.chunk_size):
-                    now_perf = time.perf_counter()
-                    if now_perf - last_chunk_perf > self.args.chunk_timeout:
-                        raise TTSResponseError(f"Stream chunk timeout: no data for {self.args.chunk_timeout:.2f}s")
-                    if not chunk:
-                        continue
-                    if first_byte_ms is None:
-                        first_byte_ms = (now_perf - start_perf) * 1000
-                    last_chunk_perf = now_perf
-                    received_after = output_bytes + len(chunk)
-                    if len(prefix_buffer) < MAX_WAV_PREFIX_BYTES:
-                        prefix_room = MAX_WAV_PREFIX_BYTES - len(prefix_buffer)
-                        prefix_buffer.extend(chunk[:prefix_room])
-                        wav_info = parse_wav_format_prefix(bytes(prefix_buffer))
-                    if first_audio_ms is None:
-                        if wav_info.data_offset is not None and received_after > wav_info.data_offset:
-                            first_audio_ms = (now_perf - start_perf) * 1000
-                        elif not self.args.require_wav:
-                            first_audio_ms = (now_perf - start_perf) * 1000
-                    file.write(chunk)
-                    output_bytes += len(chunk)
-                    response_bytes += len(chunk)
+            content_type = response.headers.get("Content-Type", "").lower()
+            expects_json_audio = self.args.response_format == "json" or "application/json" in content_type
+            if expects_json_audio:
+                first_byte_ms, first_audio_ms, output_bytes, response_bytes = self.read_json_audio_response(
+                    response,
+                    save_path,
+                    start_perf,
+                )
+            else:
+                first_byte_ms, first_audio_ms, output_bytes, response_bytes = self.read_audio_stream_response(
+                    response,
+                    save_path,
+                    start_perf,
+                )
 
             if output_bytes < self.args.min_audio_bytes:
                 raise TTSResponseError(
@@ -812,8 +1004,8 @@ class TTSLadderTester:
 
         print(f"\n{'=' * 80}")
         print(
-            f"开始阶梯：并发={concurrency}, 模型池={self.current_model_pool_size}, "
-            f"计划请求={total_requests}, 同步 burst={burst_count}, stream={self.args.stream}"
+            f"开始并发阶梯：目标并发={concurrency}, HTTP放行池={self.current_model_pool_size}, "
+            f"计划请求数={total_requests}, 同步批次数={burst_count}, 流式输出(stream)={self.args.stream}"
         )
         if self.args.random_per_request:
             print("文本策略：每个请求独立随机选择文本")
@@ -828,7 +1020,7 @@ class TTSLadderTester:
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
             for burst_id in range(1, burst_count + 1):
                 if not RUNNING:
-                    print("检测到停止信号：不再启动新的 burst。")
+                    print("检测到停止信号：不再启动新的同步批次。")
                     break
 
                 burst_size = min(concurrency, total_requests - scheduled)
@@ -847,8 +1039,8 @@ class TTSLadderTester:
                 gate_ready = start_gate.wait_until_ready(timeout=self.args.start_timeout)
                 if not gate_ready:
                     reason = (
-                        f"StartGate timeout: concurrency={concurrency}, burst={burst_id}, "
-                        f"ready={start_gate.ready}/{burst_size}, timeout={self.args.start_timeout:.2f}s"
+                        f"同步启动门等待超时: 并发={concurrency}, 批次={burst_id}, "
+                        f"就绪线程={start_gate.ready}/{burst_size}, 超时={self.args.start_timeout:.2f}s"
                     )
                     print(f"启动超时: {reason}")
                     start_gate.abort(reason)
@@ -860,7 +1052,7 @@ class TTSLadderTester:
                     break
 
                 burst_start = time.perf_counter()
-                print(f"释放 burst {burst_id}/{burst_count}: {burst_size} 个请求同时发起")
+                print(f"释放同步批次 {burst_id}/{burst_count}: {burst_size} 个请求同时发起")
                 start_gate.release()
 
                 for future in concurrent.futures.as_completed(futures):
@@ -902,11 +1094,14 @@ def summarize_step(
     burst_rounds: int,
     results: list[RequestResult],
 ) -> StepResult:
+    """汇总一个并发阶梯的成功率、吞吐、延迟分位数和音频生成效率。"""
     success = [item for item in results if item.success]
     failed = [item for item in results if not item.success]
     sent_results = [item for item in results if item.send_perf > 0]
     http_results = [item for item in sent_results if item.http_started]
 
+    # 有效活跃耗时：每轮同步批次从统一释放到最后一个请求结束的耗时之和。
+    # 这个口径用于计算服务真正承压期间的 QPS，避免同步批次间隔拉低吞吐。
     burst_windows: list[float] = []
     for burst_id in sorted({item.burst_id for item in sent_results}):
         burst_items = [item for item in sent_results if item.burst_id == burst_id]
@@ -923,6 +1118,10 @@ def summarize_step(
         wall_window_duration = 0.0
     idle_between_bursts = max(wall_window_duration - effective_duration, 0.0)
 
+    # 三类耗时口径：
+    # 1. 成功响应耗时：只统计成功样本，用于用户可感知的稳定延迟。
+    # 2. 全量端到端耗时：统计已进入 HTTP 阶段的所有样本，失败和超时也纳入容量判断。
+    # 3. HTTP 阶段耗时：从 requests.post 发起到响应读完，不包含本地模型池等待。
     response_times = [item.total_ms for item in success]
     all_response_times = [item.total_ms for item in http_results]
     http_response_times = [item.http_total_ms for item in http_results if item.http_total_ms is not None]
@@ -999,56 +1198,73 @@ def summarize_step(
 
 
 def print_step_report(step: StepResult) -> None:
-    print(f"\n并发 {step.concurrency} 阶梯结果")
-    print(f"计划/完成请求: {step.attempted_requests}/{step.completed_requests}")
-    print(f"成功/失败: {step.success_count}/{step.failed_count} ({step.success_rate:.2f}%)")
+    print(f"\n并发阶梯 {step.concurrency} 结果")
+    print(f"请求数量（计划/完成）: {step.attempted_requests}/{step.completed_requests}")
+    print(f"请求结果（成功/失败/成功率）: {step.success_count}/{step.failed_count}/{step.success_rate:.2f}%")
     print(
-        f"同步 burst: {step.burst_rounds}, 满并发 burst: "
+        f"同步批次: {step.burst_rounds} 轮, 满并发批次: "
         f"{step.full_concurrency_bursts}/{step.burst_rounds}"
     )
-    print(f"目标并发/模型池/实际 HTTP 峰值: {step.configured_concurrency}/{step.model_pool_size}/{step.observed_peak_inflight}")
-    print(f"总耗时: {step.total_duration_s:.2f}s")
     print(
-        f"有效活跃耗时: {step.effective_duration_s:.2f}s, "
-        f"首尾窗口: {step.wall_window_duration_s:.2f}s, "
-        f"burst 空闲: {step.idle_between_bursts_s:.2f}s"
+        "并发配置（目标并发/HTTP放行池/实际HTTP峰值）: "
+        f"{step.configured_concurrency}/{step.model_pool_size}/{step.observed_peak_inflight}"
+    )
+    print(f"阶梯总耗时: {step.total_duration_s:.2f}s")
+    print(
+        f"压测时间窗口: 有效活跃耗时={step.effective_duration_s:.2f}s, "
+        f"首尾墙钟窗口={step.wall_window_duration_s:.2f}s, "
+        f"批次间空闲耗时={step.idle_between_bursts_s:.2f}s"
     )
     print(
-        f"总 QPS/成功 QPS: {step.total_qps:.2f}/{step.success_qps:.2f}, "
-        f"HTTP QPS: {step.http_qps:.2f}, "
-        f"首尾窗口总 QPS/成功 QPS: {step.total_qps_wall:.2f}/{step.success_qps_wall:.2f}"
+        f"吞吐量（按有效活跃耗时）: 总请求QPS={step.total_qps:.2f}, "
+        f"成功请求QPS={step.success_qps:.2f}, HTTP发送QPS={step.http_qps:.2f}"
+    )
+    print(
+        f"吞吐量（按首尾墙钟窗口）: 总请求QPS={step.total_qps_wall:.2f}, "
+        f"成功请求QPS={step.success_qps_wall:.2f}"
     )
     print(
         "成功响应耗时: "
-        f"avg={format_ms(step.avg_response_ms)}, "
-        f"p50={format_ms(step.p50_response_ms)}, "
-        f"p90={format_ms(step.p90_response_ms)}, "
-        f"p95={format_ms(step.p95_response_ms)}, "
-        f"p99={format_ms(step.p99_response_ms)}, "
-        f"min={format_ms(step.min_response_ms)}, "
-        f"max={format_ms(step.max_response_ms)}"
+        f"平均值={format_ms(step.avg_response_ms)}, "
+        f"P50={format_ms(step.p50_response_ms)}, "
+        f"P90={format_ms(step.p90_response_ms)}, "
+        f"P95={format_ms(step.p95_response_ms)}, "
+        f"P99={format_ms(step.p99_response_ms)}, "
+        f"最小值={format_ms(step.min_response_ms)}, "
+        f"最大值={format_ms(step.max_response_ms)}"
     )
     print(
         "全量端到端耗时: "
-        f"avg={format_ms(step.all_avg_response_ms)}, "
-        f"p50={format_ms(step.all_p50_response_ms)}, "
-        f"p95={format_ms(step.all_p95_response_ms)}, "
-        f"p99={format_ms(step.all_p99_response_ms)}"
+        f"平均值={format_ms(step.all_avg_response_ms)}, "
+        f"P50={format_ms(step.all_p50_response_ms)}, "
+        f"P95={format_ms(step.all_p95_response_ms)}, "
+        f"P99={format_ms(step.all_p99_response_ms)}"
     )
     print(
-        "HTTP阶段耗时: "
-        f"avg={format_ms(step.http_avg_response_ms)}, "
-        f"p50={format_ms(step.http_p50_response_ms)}, "
-        f"p95={format_ms(step.http_p95_response_ms)}, "
-        f"p99={format_ms(step.http_p99_response_ms)}"
+        "HTTP阶段耗时（不含本地等待）: "
+        f"平均值={format_ms(step.http_avg_response_ms)}, "
+        f"P50={format_ms(step.http_p50_response_ms)}, "
+        f"P95={format_ms(step.http_p95_response_ms)}, "
+        f"P99={format_ms(step.http_p99_response_ms)}"
     )
-    print(f"TTFB: avg={format_ms(step.avg_ttfb_ms)}, p95={format_ms(step.p95_ttfb_ms)}")
-    print(f"TTFT: avg={format_ms(step.avg_ttft_ms)}, p95={format_ms(step.p95_ttft_ms)}")
-    print(f"RTF: avg={format_number(step.avg_rtf)}, p95={format_number(step.p95_rtf)}, max={format_number(step.max_rtf)}")
+    print(
+        "首字节耗时（TTFB）: "
+        f"平均值={format_ms(step.avg_ttfb_ms)}, P95={format_ms(step.p95_ttfb_ms)}"
+    )
+    print(
+        "首段音频耗时（TTFT）: "
+        f"平均值={format_ms(step.avg_ttft_ms)}, P95={format_ms(step.p95_ttft_ms)}"
+    )
+    print(
+        "实时率（RTF，越低表示生成越快）: "
+        f"平均值={format_number(step.avg_rtf)}, "
+        f"P95={format_number(step.p95_rtf)}, "
+        f"最大值={format_number(step.max_rtf)}"
+    )
     print(
         f"音频总时长: {step.audio_total_duration_s:.2f}s, "
-        f"音频吞吐: {step.audio_throughput:.2f} audio-s/s, "
-        f"输出: {step.total_output_bytes / 1024:.2f}KB"
+        f"音频吞吐量={step.audio_throughput:.2f} 音频秒/秒, "
+        f"输出音频大小={step.total_output_bytes / 1024:.2f}KB"
     )
     if step.error_summary:
         print("失败原因统计:")
@@ -1114,6 +1330,7 @@ def build_final_report(
         "# TTS 阶梯式并发压测报告",
         "",
         f"- 生成时间: {now}",
+        "- 请求模式: 网关访问",
         f"- URL: {args.url}",
         f"- 模型: {args.model}",
         f"- stream: {args.stream}",
@@ -1126,28 +1343,33 @@ def build_final_report(
         "",
         f"- {conclusion}",
     ]
+    lines[5:5] = [
+        f"- 组件编码(componentCode): {args.component_code}",
+        f"- 子功能(function): {args.function}",
+        f"- 响应格式(response_format): {args.response_format}",
+    ]
     if best_audio:
         lines.append(
             f"- 达标范围内最高音频吞吐出现在并发 {best_audio.concurrency}: "
-            f"{best_audio.audio_throughput:.2f} audio-s/s，成功 QPS={best_audio.success_qps:.2f}。"
+            f"{best_audio.audio_throughput:.2f} 音频秒/秒，成功请求QPS={best_audio.success_qps:.2f}。"
         )
     if best_rtf:
         lines.append(
-            f"- 达标范围内最低平均 RTF 出现在并发 {best_rtf.concurrency}: "
-            f"avg RTF={best_rtf.avg_rtf:.3f}, P95 RTF={format_number(best_rtf.p95_rtf, digits=3)}。"
+            f"- 达标范围内最低平均实时率（RTF）出现在并发 {best_rtf.concurrency}: "
+            f"平均RTF={best_rtf.avg_rtf:.3f}, P95 RTF={format_number(best_rtf.p95_rtf, digits=3)}。"
         )
 
     lines.extend(
         [
             "- 分析口径: 响应耗时从 StartGate 释放请求开始计算，成功耗时包含模型池等待、网络传输、服务端处理和流式读取。",
-            "- 有效活跃耗时 = 各 burst 从释放到最后一个请求完成的活跃窗口之和，不包含 burst 之间的等待间隔；首尾窗口耗时会单独列出用于观察间隔影响。",
+            "- 有效活跃耗时 = 各同步批次从释放到最后一个请求完成的活跃窗口之和，不包含批次之间的等待间隔；首尾窗口耗时会单独列出用于观察间隔影响。",
             "- 全量端到端耗时只统计已经进入 HTTP 阶段的请求，但耗时从 StartGate 释放开始计算，包含本地模型池等待；HTTP 阶段耗时从实际发起 requests.post 开始计算。",
             "- 音频吞吐 = 成功请求音频总时长 / 有效活跃耗时；RTF = 单请求总耗时 / 音频时长。",
             "- 当成功率下降、全量 P95 成倍增长、音频吞吐不再提升且 RTF 上升时，通常说明系统已经接近容量上限。",
             "",
             "## 阶梯结果",
             "",
-            "| 并发 | 模型池 | 请求数 | HTTP数 | 成功率 | 成功QPS | 总QPS | 首尾成功QPS | 全量端到端P95 | HTTP阶段P95 | 成功P95 | TTFB P95 | TTFT P95 | avg RTF | P95 RTF | 音频吞吐 | 首尾音频吞吐 | 活跃耗时 | 空闲耗时 | 音频总时长 | HTTP峰值 |",
+            "| 并发 | HTTP放行池 | 请求数 | HTTP数 | 成功率 | 成功请求QPS | 总请求QPS | 首尾成功QPS | 全量端到端P95 | HTTP阶段P95 | 成功P95 | 首字节P95(TTFB) | 首段音频P95(TTFT) | 平均RTF | P95 RTF | 音频吞吐 | 首尾音频吞吐 | 活跃耗时 | 空闲耗时 | 音频总时长 | HTTP峰值 |",
             "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
@@ -1221,12 +1443,20 @@ def parse_concurrent_levels(value: str) -> list[int]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="TTS 阶梯式并发压测脚本：ThreadPoolExecutor + StartGate 同步 burst 释放请求。"
+        description="TTS 阶梯式并发压测脚本：ThreadPoolExecutor + StartGate 同步批次释放请求。"
     )
-    parser.add_argument("--url", default=URL, help="TTS instruct2 接口地址")
-    parser.add_argument("--model", default="instruct2", help="请求体中的 model 字段")
+    # 网关访问参数：固定使用统一 /predict 入口，签名方式参考 gateway_tts/tts_api_npu_gateway.py。
+    parser.add_argument("--app-key", default=DEFAULT_GATEWAY_APP_KEY, help="网关 HMAC username/app_key")
+    parser.add_argument("--secret-key", default=DEFAULT_GATEWAY_SECRET_KEY, help="网关 HMAC secret_key")
+    parser.add_argument("--component-code", default=DEFAULT_GATEWAY_COMPONENT_CODE, help="网关 componentCode")
+    parser.add_argument("--function", default="zero_shot", choices=["zero_shot", "instruct2", "cross_lingual"], help="网关 function 字段")
+    parser.add_argument("--model", default=DEFAULT_GATEWAY_MODEL, help="请求体中的 model 字段；网关默认 tts-v1")
+
+    # TTS 业务参数：请求体会转换为 input_text/speaker_id 等网关字段。
     parser.add_argument("--text", default="", help="固定合成文本；也支持 @file.txt 从文件读取")
     parser.add_argument("--random-per-request", action="store_true", help="每个请求独立随机选择文本")
+    parser.add_argument("--prompt-text", default="这是一段参考文本", help="网关 zero_shot 的 prompt_text")
+    parser.add_argument("--speaker-id", default="", help="网关 speaker_id；为空时使用 --zero-shot-spk-id")
     parser.add_argument("--prompt-audio", default="kehu_female_b", help="prompt_audio 音色 ID")
     parser.add_argument("--zero-shot-spk-id", default="kehu_female_b", help="zero_shot_spk_id 音色 ID")
     parser.add_argument("--instruct-text", default="You are a helpful assistant. 很自然地说|endofprompt|>", help="instruct_text")
@@ -1240,31 +1470,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-frontend", type=str2bool, default=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--res-content", type=str2bool, default=True)
+    parser.add_argument("--response-format", default="json", choices=["json", "wav"], help="网关 tts_params.response_format")
 
+    # 并发阶梯参数：每个阶梯按 StartGate 同步释放一批请求，用于制造更接近真实并发的瞬时压力。
     parser.add_argument("--concurrent-levels", type=parse_concurrent_levels, default=None, help="并发阶梯，如 1,2,4,8,16,32")
     parser.add_argument("--concurrent", type=int, default=None, help="只测试一个指定并发级别")
     parser.add_argument("--start-concurrent", type=int, default=1)
     parser.add_argument("--max-concurrent", type=int, default=32)
     parser.add_argument("--step", type=int, default=1)
-    parser.add_argument("--rounds", type=int, default=5, help="未指定 --total 时，每个阶梯执行多少轮同步 burst")
+    parser.add_argument("--rounds", type=int, default=5, help="未指定 --total 时，每个阶梯执行多少轮同步批次")
     parser.add_argument("--total", type=int, default=None, help="每个阶梯最少请求数，会自动补齐为当前并发整数倍")
-    parser.add_argument("--burst-interval", type=float, default=0.0, help="阶梯内两轮 burst 之间的最小间隔秒数")
+    parser.add_argument("--burst-interval", type=float, default=0.0, help="阶梯内两轮同步批次之间的最小间隔秒数")
 
+    # 超时和连接池参数：connect/read 是 requests 超时，chunk-timeout 是流式响应两包之间的最大等待。
     parser.add_argument("--connect-timeout", type=float, default=5.0)
     parser.add_argument("--read-timeout", type=float, default=2100.0)
     parser.add_argument("--chunk-timeout", type=float, default=120.0, help="流式包间隔超时秒数")
     parser.add_argument("--model-acquire-timeout", type=float, default=1200.0, help="模型池信号量获取超时秒数")
     parser.add_argument("--model-pool-size", type=int, default=None, help="实际同时发出 HTTP 请求上限；默认等于当前阶梯并发")
-    parser.add_argument("--start-timeout", type=float, default=30.0, help="等待 burst 内所有 worker 就绪的超时时间")
+    parser.add_argument("--start-timeout", type=float, default=30.0, help="等待同步批次内所有 worker 就绪的超时时间")
     parser.add_argument("--http-pool-size", type=int, default=200)
     parser.add_argument("--chunk-size", type=int, default=8192)
     parser.add_argument("--verify-ssl", action="store_true", help="默认不校验证书；传入后启用校验")
 
+    # 拐点判定参数：成功率下降、P95 成倍增长或低于停止成功率时，可提前停止后续阶梯。
     parser.add_argument("--success-threshold", type=float, default=95.0, help="稳定并发成功率阈值")
     parser.add_argument("--latency-growth-threshold", type=float, default=2.0, help="相邻阶梯全量端到端 P95 增长倍数阈值")
     parser.add_argument("--break-confirmations", type=int, default=2, help="连续触发多少个阶梯后确认拐点")
     parser.add_argument("--stop-success-rate", type=float, default=50.0, help="成功率低于该值时立即停止后续阶梯")
 
+    # 输出和校验参数：成功请求会保存 WAV，并基于音频时长计算 RTF 和音频吞吐。
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="WAV 输出目录")
     parser.add_argument("--report-dir", default="reports", help="报告输出目录")
     parser.add_argument("--keep-wav-files", type=int, default=30, help="自动清理时保留最近 N 个 WAV；负数表示不清理")
@@ -1278,10 +1513,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--debug-errors", action="store_true", help="失败原因中追加短 traceback")
     parser.add_argument("--print-payload", action="store_true", help="打印示例 payload 后继续执行")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.url = URL
+    return args
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if not args.app_key:
+        raise ValueError("--app-key 不能为空")
+    if not args.secret_key:
+        raise ValueError("--secret-key 不能为空")
+    if not args.component_code:
+        raise ValueError("--component-code 不能为空")
+    if not args.model:
+        raise ValueError("--model 不能为空")
+    if not args.function:
+        raise ValueError("--function 不能为空")
     if args.concurrent is not None and args.concurrent <= 0:
         raise ValueError("--concurrent must be > 0")
     if args.start_concurrent <= 0 or args.max_concurrent <= 0 or args.step <= 0:
@@ -1293,7 +1540,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.total is not None and args.total <= 0:
         raise ValueError("--total must be > 0")
     if args.burst_interval < 0:
-        raise ValueError("--burst-interval cannot be negative")
+        raise ValueError("--burst-interval 不能为负数")
     if args.connect_timeout <= 0 or args.read_timeout <= 0 or args.chunk_timeout <= 0:
         raise ValueError("timeouts must be > 0")
     if args.model_acquire_timeout <= 0 or args.start_timeout <= 0:
@@ -1359,11 +1606,17 @@ def main() -> int:
 
     levels = resolve_levels(args, sys.argv)
     print("\nTTS 阶梯式并发压测")
+    print("请求模式: 网关访问")
     print(f"目标 URL: {args.url}")
+    print(
+        f"网关配置: 组件编码(componentCode)={args.component_code}, "
+        f"模型(model)={args.model}, 子功能(function)={args.function}, "
+        f"响应格式(response_format)={args.response_format}"
+    )
     print(f"并发级别: {levels}")
     print(
         f"请求计划: "
-        f"{'每阶梯至少 ' + str(args.total) + ' 个请求' if args.total else '每阶梯 ' + str(args.rounds) + ' 轮 burst'}"
+        f"{'每阶梯至少 ' + str(args.total) + ' 个请求' if args.total else '每阶梯 ' + str(args.rounds) + ' 轮同步批次'}"
     )
     print(f"报告目录: {Path(args.report_dir).resolve()}")
 
