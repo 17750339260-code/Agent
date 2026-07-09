@@ -7,7 +7,7 @@ import pytest
 # ===================== 配置（完全不变）=====================
 API_URL = "http://36.111.82.53:10017/v1/audio/trans"
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AUDIO_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "1.wav")
+AUDIO_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "61.wav")
 MP4_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "")
 MP3_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "6.mp3")
 
