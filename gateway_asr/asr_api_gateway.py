@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 import hmac
 from hashlib import sha256
 
-# ASR Gateway 配置
+# ASR Gateway 配置 ----公司环境
 # ASR_BINDING = "southgrid"
 # ASR_MODEL = "funasr-iic"
 # ASR_BINDING_HOST = "https://192.168.0.213:18300/ai-inference-gateway/predict"
@@ -25,6 +25,15 @@ from hashlib import sha256
 # ASR_CUSTCODE = "1001300033"
 # ASR_COMPONENTCODE = "04101002"
 
+# ASR Gateway 配置 --------省测做评测
+ASR_BINDING = "southgrid"
+ASR_MODEL = "funasr-iic"
+ASR_BINDING_HOST = "https://10.134.252.232:5030/ai-gateway/predict"
+ASR_BINDING_API_KEY = "b899eef382324e8d8973493fb9c35998"
+ASR_CUSTCODE = "1000400672300031"
+ASR_COMPONENTCODE = "04351378"
+
+# # ASR Gateway 配置 --------网级做评测
 # ASR_BINDING = "southgrid"
 # ASR_MODEL = "funasr-iic"
 # ASR_BINDING_HOST = "https://10.10.65.213:18300/ai-inference-gateway/predict"
@@ -32,13 +41,8 @@ from hashlib import sha256
 # ASR_CUSTCODE = "1001300033"
 # ASR_COMPONENTCODE = "04101002"
 
-# ASR Gateway 配置
-ASR_BINDING = "southgrid"
-ASR_MODEL = "funasr-iic"
-ASR_BINDING_HOST = "https://10.134.252.232:5030/ai-gateway/predict"
-ASR_BINDING_API_KEY = "b899eef382324e8d8973493fb9c35998"
-ASR_CUSTCODE = "1000400672300031"
-ASR_COMPONENTCODE = "04351378"
+
+
 def getLocalAuthInfo(customerCode, secretKey):
     """生成认证信息"""
     # 使用Python内置datetime生成正确格式的GMT日期，确保英文格式
@@ -55,7 +59,6 @@ def getLocalAuthInfo(customerCode, secretKey):
 
     authorization = f'hmac username="{customerCode}", algorithm="hmac-sha256", headers="x-date", signature="{signature}"'
     return date_value, authorization
-
 
 def asr_via_gateway(audio_file, model="funasr-iic", hotwords=None, is_return_timestamp=False):
     """
