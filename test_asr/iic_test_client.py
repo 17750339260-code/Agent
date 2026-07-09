@@ -9,7 +9,7 @@ import soundfile as sf
 API_URL = "http://36.111.82.53:10017/v1/audio/trans"
 # Get the project root directory (assuming script is in app4npu/)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AUDIO_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "儿童故事 - 吉吉和磨磨.mp3")
+AUDIO_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "61.wav")
 
 def generate_dummy_mp3(filename):
     """
