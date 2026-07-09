@@ -30,13 +30,17 @@ manifest 示例：
 from __future__ import annotations
 
 import base64
+import contextlib
 import csv
+import io
 import json
 import math
+import mimetypes
 import os
 import re
 import statistics
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -46,7 +50,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
+import string
 import pytest
 import requests
 
@@ -61,14 +65,15 @@ except ImportError:  # pragma: no cover
     psutil = None
 
 try:
-    import jieba
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        import jieba
 except ImportError:  # pragma: no cover
     jieba = None
 
-try:
-    from bert_score import score as bert_score_score
-except ImportError:  # pragma: no cover
-    bert_score_score = None
+bert_score_score = None
+BERTSCORE_IMPORT_ERROR = ""
+BERTSCORE_IMPORT_ATTEMPTED = False
 
 
 # ===================== 基础配置 =====================
@@ -80,8 +85,17 @@ DEFAULT_MANIFEST = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_json", "asr_
 API_URL = os.environ.get("ASR_API_URL", "http://36.111.82.53:10017/v1/audio/trans")
 ASR_MODEL = os.environ.get("ASR_MODEL", "funasr-iic")
 REQUEST_TIMEOUT_SEC = int(os.environ.get("ASR_TIMEOUT_SEC", "21600"))
+ASR_CONNECT_TIMEOUT_SEC = float(os.environ.get("ASR_CONNECT_TIMEOUT_SEC", "10"))
 LANGUAGE = os.environ.get("ASR_LANGUAGE", "zh")
 ASR_PROGRESS_INTERVAL_SEC = float(os.environ.get("ASR_PROGRESS_INTERVAL_SEC", "10"))
+ASR_EXTRACT_AUDIO_ONLY = os.environ.get("ASR_EXTRACT_AUDIO_ONLY", "1") == "1"
+ASR_USE_DATA_URI = os.environ.get("ASR_USE_DATA_URI", "0") == "1"
+ASR_REQUEST_MODE = os.environ.get("ASR_REQUEST_MODE", "json").strip().lower()
+if ASR_REQUEST_MODE not in {"multipart", "json"}:
+    warnings.warn(f"未知 ASR_REQUEST_MODE={ASR_REQUEST_MODE}，已回退到 json", RuntimeWarning)
+    ASR_REQUEST_MODE = "json"
+ASR_PREFLIGHT = os.environ.get("ASR_PREFLIGHT", "1") == "1"
+ASR_PREFLIGHT_AUDIO = os.environ.get("ASR_PREFLIGHT_AUDIO", "")
 
 # 一致性测试重复次数。大模型若存在采样随机性，同一音频多次结果不一致会被量化。短音频建议设置 3，长音频建议设置 1。
 CONSISTENCY_RUNS = int(os.environ.get("ASR_CONSISTENCY_RUNS", "1"))
@@ -105,7 +119,14 @@ PUNCTUATION_CHARS = set("，。！？；：、,.!?;:()（）《》“”\"'")
 ITN_TOKEN_RE = re.compile(
     r"(\d+(?:[.,:：/-]\d+)*(?:%|％)?|[A-Za-z]+(?:-[A-Za-z]+)*|[￥$]\s*\d+(?:\.\d+)?)"
 )
-
+# 在 import jieba 之后，配置区附近添加
+_CUSTOM_DICT = os.environ.get("ASR_JIEBA_DICT", os.path.join(PROJECT_ROOT, "test_asr", "asr_test_json", "asr_dict.txt"))
+if jieba is not None:
+    if os.path.exists(_CUSTOM_DICT):
+        jieba.load_userdict(_CUSTOM_DICT)
+        print(f"[WER] 已加载自定义词典：{_CUSTOM_DICT}")
+    else:
+        print(f"[WER] 自定义词典未找到，将使用默认分词：{_CUSTOM_DICT}")
 
 @dataclass
 class AsrMetricCase:
@@ -151,24 +172,66 @@ class TranscribeResult:
     resource: ResourceSnapshot = field(default_factory=ResourceSnapshot)
 
 
+@dataclass
+class MediaInfo:
+    """本地媒体探测结果；优先用于诊断和长音频进度展示。"""
+
+    duration_sec: Optional[float] = None
+    format_name: str = ""
+    audio_codec: str = ""
+    sample_rate: Optional[int] = None
+    channels: Optional[int] = None
+    bits_per_sample: Optional[int] = None
+    has_audio: bool = False
+    has_video: bool = False
+    note: str = ""
+
+
+@dataclass
+class PreparedAsrInput:
+    """一次 ASR 请求实际上传的文件。temp_dir 存在时由调用方负责清理。"""
+
+    path: str
+    media_info: MediaInfo = field(default_factory=MediaInfo)
+    note: str = ""
+    temp_dir: Any = None
+
+    def cleanup(self) -> None:
+        if self.temp_dir is not None:
+            self.temp_dir.cleanup()
+            self.temp_dir = None
+
+
 # ===================== 文本规范化与编辑距离 =====================
 
 
+# 保留数字、字母、中文、以及数字相关符号，只去掉纯中文标点和空白
+_CHINESE_PUNCT = set("，。！？；：、”“‘’（）《》【】…—～")
+# 这些符号在语义上有用，要保留（如小数点、连接符）
+_KEEP_SYMBOLS = set(".-/%$€¥")
+
 def normalize_for_cer(text: str) -> str:
-    """CER 前处理：去空白和常见标点，保留中文、英文、数字等语义字符。"""
+    """CER 专用归一化：去掉空白和纯中文标点，保留数字/字母/有意义符号"""
     text = text or ""
     chars = []
     for ch in text.lower():
-        if ch.isspace() or ch in PUNCTUATION_CHARS:
+        if ch.isspace() or ch in _CHINESE_PUNCT:
             continue
-        chars.append(ch)
+        if ch in string.ascii_letters or ch in string.digits or ch in _KEEP_SYMBOLS or '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+            chars.append(ch)
+        elif ch not in string.punctuation:  # 其他标点也去掉，但保留中日韩字符
+            chars.append(ch)
     return "".join(chars)
 
 
 def normalize_for_entity(text: str) -> str:
-    """实体匹配前处理：去空白和标点，避免格式差异影响专名/否定词命中。"""
-    return normalize_for_cer(text)
+    """实体匹配专用：仅去空白，保留所有标点，因为实体可能含数字符号"""
+    return re.sub(r'\s+', '', (text or "").lower())
 
+
+def normalize_for_hallucination(text: str) -> str:
+    """幻觉检测专用：只去掉空白，避免误删纯标点输出"""
+    return re.sub(r'\s+', '', (text or ""))
 
 def levenshtein_distance(ref: Sequence[Any], hyp: Sequence[Any]) -> int:
     """标准动态规划编辑距离，用于 CER/WER/序列准确率。"""
@@ -195,21 +258,23 @@ def safe_error_rate(ref_items: Sequence[Any], hyp_items: Sequence[Any]) -> Optio
 
 
 def tokenize_words(text: str) -> List[str]:
-    """
-    WER 分词：
-    - 若文本本身有空格，按空格切词，适合英文或人工已分词文本；
-    - 中文无空格时优先用 jieba，未安装时退化为字符级 token，并在报告中说明。
-    """
+    # 统一小写，压缩所有空白字符为一个空格
     normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
     if not normalized:
         return []
-    if " " in normalized:
-        # WER 标准定义不应丢弃标点；空格分词路径仅去除空 token，保留标点参与编辑距离。
-        return [t for t in normalized.split(" ") if t.strip()]
+
+    # 如果 jieba 可用，始终优先使用 jieba 分词（适合中文）
     if jieba is not None:
-        # jieba 分词路径同样保留标点，避免过滤标点导致 WER 偏低。
-        return [t for t in jieba.lcut(normalized) if t.strip()]
-    # 字符级退化不能复用 normalize_for_cer，因为 CER 规范化会去掉标点；这里只小写并过滤空白字符。
+        tokens = [t for t in jieba.lcut(normalized) if t.strip()]
+        if tokens:   # 正常情况下 tokens 不为空
+            return tokens
+        # 极端情况 tokens 全为空？继续尝试后序方法
+
+    # 若无 jieba，且文本含有空格，则按空格分词（主要用于英文）
+    if " " in normalized:
+        return [t for t in normalized.split(" ") if t.strip()]
+
+    # 否则字符级退化（例如中文无空格且无 jieba）
     return [ch for ch in normalized if not ch.isspace()]
 
 
@@ -236,6 +301,30 @@ def calc_text_similarity_by_cer(text_a: str, text_b: str) -> Optional[float]:
 # ===================== 语义、幻觉、格式化、实体指标 =====================
 
 
+def get_bertscore_score():
+    """按需加载 BERTScore，避免 ASR 请求阶段被 torch/numpy 兼容警告干扰。"""
+    global bert_score_score, BERTSCORE_IMPORT_ERROR, BERTSCORE_IMPORT_ATTEMPTED
+    if BERTSCORE_IMPORT_ATTEMPTED:
+        return bert_score_score
+
+    BERTSCORE_IMPORT_ATTEMPTED = True
+    stderr_buffer = io.StringIO()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with contextlib.redirect_stderr(stderr_buffer):
+                from bert_score import score as imported_score
+        bert_score_score = imported_score
+        return bert_score_score
+    except Exception as exc:  # pragma: no cover - 依赖/torch/numpy 兼容问题
+        captured = stderr_buffer.getvalue().strip()
+        BERTSCORE_IMPORT_ERROR = f"{exc}"
+        if captured:
+            BERTSCORE_IMPORT_ERROR = f"{BERTSCORE_IMPORT_ERROR}；{captured[:300]}"
+        bert_score_score = None
+        return None
+
+
 def calc_bertscore(reference: str, hypothesis: str) -> Tuple[Optional[float], str]:
     """
     BERTScore F1：调用成熟 bert_score 包计算语义相似度。
@@ -246,11 +335,13 @@ def calc_bertscore(reference: str, hypothesis: str) -> Tuple[Optional[float], st
         return None, "缺少人工参考文本"
     if not hypothesis.strip():
         return 0.0, "识别为空"
-    if bert_score_score is None:
-        return None, "未安装 bert_score，可执行 pip install bert-score"
+    scorer = get_bertscore_score()
+    if scorer is None:
+        detail = f"：{BERTSCORE_IMPORT_ERROR}" if BERTSCORE_IMPORT_ERROR else ""
+        return None, f"未安装或无法加载 bert_score，可执行 pip install bert-score{detail}"
 
     try:
-        _, _, f1 = bert_score_score(
+        _, _, f1 = scorer(
             [hypothesis],
             [reference],
             lang="zh",
@@ -273,7 +364,7 @@ def calc_hallucination(is_probe: bool, hypothesis: str) -> Optional[float]:
     """
     if not is_probe:
         return None
-    return 1.0 if normalize_for_cer(hypothesis) else 0.0
+    return 1.0 if normalize_for_hallucination(hypothesis) else 0.0
 
 
 def extract_punctuation_sequence(text: str) -> List[str]:
@@ -390,6 +481,204 @@ def calc_entity_accuracy(
 # ===================== 音频与资源采样 =====================
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def probe_media_info(file_path: str) -> MediaInfo:
+    """用 ffprobe 识别真实媒体类型；失败时返回带 note 的空结果。"""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,size,format_name",
+                "-show_entries",
+                "stream=codec_name,codec_type,channels,sample_rate,bits_per_sample",
+                "-of",
+                "json",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except FileNotFoundError:
+        return MediaInfo(note="ffprobe 不可用，无法识别真实媒体类型")
+    except Exception as exc:
+        return MediaInfo(note=f"ffprobe 探测失败：{exc}")
+
+    if proc.returncode != 0:
+        return MediaInfo(note=(proc.stderr or "ffprobe 探测失败").strip()[:300])
+
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return MediaInfo(note=f"ffprobe 输出无法解析：{exc}")
+
+    fmt_obj = data.get("format") if isinstance(data, dict) else {}
+    streams = data.get("streams") if isinstance(data, dict) else []
+    info = MediaInfo(format_name=str(fmt_obj.get("format_name") or ""))
+    try:
+        duration = fmt_obj.get("duration")
+        info.duration_sec = float(duration) if duration not in (None, "N/A", "") else None
+    except (TypeError, ValueError):
+        info.duration_sec = None
+
+    if isinstance(streams, list):
+        for stream in streams:
+            if not isinstance(stream, dict):
+                continue
+            codec_type = stream.get("codec_type")
+            if codec_type == "video":
+                info.has_video = True
+            elif codec_type == "audio" and not info.has_audio:
+                info.has_audio = True
+                info.audio_codec = str(stream.get("codec_name") or "")
+                info.sample_rate = _safe_int(stream.get("sample_rate"))
+                info.channels = _safe_int(stream.get("channels"))
+                info.bits_per_sample = _safe_int(stream.get("bits_per_sample"))
+    return info
+
+
+def is_readable_wav(file_path: str) -> bool:
+    try:
+        with wave.open(file_path, "rb"):
+            return True
+    except Exception:
+        return False
+
+
+def is_pcm_16bit_wav(file_path: str) -> bool:
+    try:
+        with wave.open(file_path, "rb") as wav:
+            return wav.getsampwidth() == 2
+    except Exception:
+        return False
+
+
+def guess_audio_mime_type(file_path: str) -> str:
+    mime, _ = mimetypes.guess_type(file_path)
+    if mime:
+        return mime
+    ext = os.path.splitext(file_path)[1].lower()
+    fallback = {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".mp4": "audio/mp4",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+    }
+    return fallback.get(ext, "application/octet-stream")
+
+
+def format_mb(byte_count: int) -> str:
+    return f"{byte_count / 1024 / 1024:.2f}MB"
+
+
+def prepare_asr_input_file(file_path: str) -> PreparedAsrInput:
+    """
+    准备实际上传给 ASR 的文件。
+    对含视频轨或扩展名伪装成 WAV 的媒体，默认抽取音频轨，避免上传整段视频。
+    """
+    info = probe_media_info(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+    wav_ok = is_readable_wav(file_path) if ext == ".wav" else False
+    needs_audio_extract = (
+        ASR_EXTRACT_AUDIO_ONLY
+        and info.has_audio
+        and (info.has_video or (ext == ".wav" and not wav_ok))
+    )
+
+    if not needs_audio_extract:
+        if info.has_video:
+            print(
+                "[ASR预处理] 检测到视频轨，但 ASR_EXTRACT_AUDIO_ONLY=0，仍按原文件上传。",
+                flush=True,
+            )
+        return PreparedAsrInput(path=file_path, media_info=info)
+
+    tmp_dir = tempfile.TemporaryDirectory(prefix="asr_audio_only_")
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(file_path))[0]).strip("_") or "input"
+
+    copy_audio = info.audio_codec.lower() in {"aac", "mp3", "alac"}
+    if copy_audio:
+        out_ext = ".m4a" if info.audio_codec.lower() in {"aac", "alac"} else ".mp3"
+        out_path = os.path.join(tmp_dir.name, f"{base}{out_ext}")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", file_path, "-map", "0:a:0", "-vn", "-c:a", "copy", out_path]
+    else:
+        out_path = os.path.join(tmp_dir.name, f"{base}.wav")
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            file_path,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            out_path,
+        ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
+            check=False,
+        )
+    except FileNotFoundError:
+        tmp_dir.cleanup()
+        print("[ASR预处理] ffmpeg 不可用，无法抽取音频轨，仍按原文件上传。", flush=True)
+        return PreparedAsrInput(path=file_path, media_info=info, note="ffmpeg 不可用，未抽取音频轨")
+    except Exception as exc:
+        tmp_dir.cleanup()
+        print(f"[ASR预处理] 抽取音频轨异常：{exc}，仍按原文件上传。", flush=True)
+        return PreparedAsrInput(path=file_path, media_info=info, note=f"抽取音频轨异常：{exc}")
+
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        tmp_dir.cleanup()
+        err = (proc.stderr or "ffmpeg 未生成输出文件").strip()[:300]
+        print(f"[ASR预处理] 抽取音频轨失败：{err}，仍按原文件上传。", flush=True)
+        return PreparedAsrInput(path=file_path, media_info=info, note=f"抽取音频轨失败：{err}")
+
+    extracted_info = probe_media_info(out_path)
+    print(
+        "[ASR预处理] 已抽取音频轨用于识别："
+        f"{os.path.basename(file_path)} ({format_mb(os.path.getsize(file_path))}) -> "
+        f"{os.path.basename(out_path)} ({format_mb(os.path.getsize(out_path))}) | "
+        f"format={info.format_name or '未知'}, audio={info.audio_codec or '未知'}, video={info.has_video}",
+        flush=True,
+    )
+    return PreparedAsrInput(
+        path=out_path,
+        media_info=extracted_info,
+        note="已抽取音频轨用于 ASR 请求",
+        temp_dir=tmp_dir,
+    )
+
+
 def get_wav_duration_sec(file_path: str) -> Optional[float]:
     """
     读取 WAV 时长；非 WAV 或无法读取时返回 None。
@@ -417,7 +706,29 @@ def get_wav_duration_sec(file_path: str) -> Optional[float]:
             return estimated_duration if header_is_unreasonable else header_duration
         return header_duration or estimated_duration
     except Exception:
-        return None
+        media_info = probe_media_info(file_path)
+        return media_info.duration_sec
+
+
+def describe_media_for_log(file_path: str, info: MediaInfo) -> str:
+    parts = [
+        f"文件={format_mb(os.path.getsize(file_path))}" if os.path.exists(file_path) else "文件=未知",
+        f"时长={format_duration(info.duration_sec)}",
+    ]
+    if info.format_name:
+        parts.append(f"format={info.format_name}")
+    if info.audio_codec:
+        audio = info.audio_codec
+        if info.sample_rate:
+            audio += f"/{info.sample_rate}Hz"
+        if info.channels:
+            audio += f"/{info.channels}ch"
+        parts.append(f"audio={audio}")
+    if info.has_video:
+        parts.append("含视频轨=True")
+    if info.note:
+        parts.append(f"探测说明={info.note}")
+    return " | ".join(parts)
 
 
 def read_wav_mono_float32(file_path: str) -> Tuple[Any, int, int, int]:
@@ -630,14 +941,28 @@ def encode_audio_as_base64(file_path: str) -> str:
 
 def build_payload(file_path: str) -> Dict[str, Any]:
     """构造 ASR 请求体；打开时间戳开关，以便尽可能解析尾字时间信息。"""
+    audio_input = encode_audio_as_base64(file_path)
+    if ASR_USE_DATA_URI:
+        audio_input = f"data:{guess_audio_mime_type(file_path)};base64,{audio_input}"
     return {
         "model": ASR_MODEL,
         "input_type": "stream",
-        "input": encode_audio_as_base64(file_path),
+        "input": audio_input,
         "hotwords": "",
         "language": LANGUAGE,
         "is_return_timestamp": True,
         "speaker_diarization": False,
+    }
+
+
+def build_multipart_form_data() -> Dict[str, str]:
+    """构造 multipart/form-data 表单字段；指标语义与 JSON 模式保持一致。"""
+    return {
+        "model": ASR_MODEL,
+        "hotwords": "",
+        "language": LANGUAGE,
+        "is_return_timestamp": "true",
+        "speaker_diarization": "false",
     }
 
 
@@ -661,18 +986,48 @@ def extract_text(response_json: Any) -> str:
 
 def transcribe_audio(file_path: str) -> TranscribeResult:
     """发送一次 ASR 请求，并记录耗时和本机资源峰值。"""
+    prepared = prepare_asr_input_file(file_path)
+    request_file = prepared.path
+    if prepared.path != file_path:
+        print(f"[ASR请求] 原始样本：{describe_media_for_log(file_path, probe_media_info(file_path))}", flush=True)
+    print(f"[ASR请求] 实际上传：{describe_media_for_log(request_file, prepared.media_info)}", flush=True)
+
     sampler = ResourceSampler()
-    progress = AsrProgressReporter(file_path, get_wav_duration_sec(file_path))
+    progress = AsrProgressReporter(request_file, get_wav_duration_sec(request_file))
     sampler.start()
     progress.start()
     start = time.perf_counter()
     try:
-        response = requests.post(
-            API_URL,
-            json=build_payload(file_path),
-            headers={"accept": "application/json", "Content-Type": "application/json"},
-            timeout=REQUEST_TIMEOUT_SEC,
-        )
+        if ASR_REQUEST_MODE == "multipart":
+            form_data = build_multipart_form_data()
+            print(
+                f"[ASR请求] POST {API_URL} | mode=multipart | upload={format_mb(os.path.getsize(request_file))} | "
+                f"connect_timeout={ASR_CONNECT_TIMEOUT_SEC}s, read_timeout={REQUEST_TIMEOUT_SEC}s",
+                flush=True,
+            )
+            with open(request_file, "rb") as f:
+                response = requests.post(
+                    API_URL,
+                    headers={"accept": "application/json"},
+                    files={"file": (os.path.basename(request_file), f, guess_audio_mime_type(request_file))},
+                    data=form_data,
+                    timeout=(ASR_CONNECT_TIMEOUT_SEC, REQUEST_TIMEOUT_SEC),
+                )
+        else:
+            payload = build_payload(request_file)
+            request_body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            print(
+                f"[ASR请求] POST {API_URL} | mode=json | JSON={format_mb(len(request_body))} | "
+                f"connect_timeout={ASR_CONNECT_TIMEOUT_SEC}s, read_timeout={REQUEST_TIMEOUT_SEC}s | "
+                f"data_uri={ASR_USE_DATA_URI}",
+                flush=True,
+            )
+            response = requests.post(
+                API_URL,
+                data=request_body,
+                headers={"accept": "application/json", "Content-Type": "application/json"},
+                timeout=(ASR_CONNECT_TIMEOUT_SEC, REQUEST_TIMEOUT_SEC),
+            )
         elapsed = time.perf_counter() - start
         try:
             body = response.json()
@@ -687,7 +1042,7 @@ def transcribe_audio(file_path: str) -> TranscribeResult:
             elapsed_sec=elapsed,
             response_json=body,
             status_code=response.status_code,
-            error="" if response.status_code == 200 else response.text[:500],
+            error="" if response.status_code == 200 else (response.text[:500] or response.reason or f"HTTP {response.status_code}"),
             resource=resource,
         )
     except Exception as exc:
@@ -702,6 +1057,8 @@ def transcribe_audio(file_path: str) -> TranscribeResult:
             error=str(exc),
             resource=resource,
         )
+    finally:
+        prepared.cleanup()
 
 
 def find_first_last_timestamp(response_json: Any) -> Tuple[Optional[float], Optional[float]]:
@@ -724,7 +1081,8 @@ def find_first_last_timestamp(response_json: Any) -> Tuple[Optional[float], Opti
             if isinstance(start, (int, float)) and isinstance(end, (int, float)):
                 s = float(start)
                 e = float(end)
-                if s > 1000 or e > 1000:
+                # 如果数值超过一天的长度（86400秒），几乎可以肯定是毫秒
+                if s > 86400 or e > 86400:
                     s /= 1000.0
                     e /= 1000.0
                 candidates.append((s, e))
@@ -746,9 +1104,11 @@ def find_first_last_timestamp(response_json: Any) -> Tuple[Optional[float], Opti
                 if isinstance(item[0], (int, float)) and isinstance(item[1], (int, float)):
                     s = float(item[0])
                     e = float(item[1])
-                    if s > 1000 or e > 1000:
+                    # 如果数值超过一天的长度（86400秒），几乎可以肯定是毫秒
+                    if s > 86400 or e > 86400:
                         s /= 1000.0
                         e /= 1000.0
+                    # 此处不再对 1000~86400 之间的值自动转换，避免误判
                     candidates.append((s, e))
 
     walk(response_json)
@@ -771,8 +1131,11 @@ def extract_latency_fields(response_json: Any) -> Tuple[Optional[float], Optiona
         for key in keys:
             value = response_json.get(key)
             if isinstance(value, (int, float)):
-                value = float(value)
-                return value / 1000.0 if value > 1000 else value
+                v = float(value)
+                # 若值 > 86400（超过一天），极可能是毫秒，转成秒
+                if v > 86400:
+                    v /= 1000.0
+                return v
         return None
 
     first = pick(first_keys)
@@ -806,6 +1169,47 @@ def load_cases() -> List[AsrMetricCase]:
         # AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "4-111.wav"), label="default-4-111"),
         AsrMetricCase(audio=os.path.join("test_asr", "asr_test_audio", "上市公司治理要求及实践.wav"), label="default-1")
     ]
+
+
+def find_preflight_audio(cases: Sequence[AsrMetricCase]) -> Optional[str]:
+    """选择一个小文件做接口冒烟，避免服务不可用时直接跑长音频。"""
+    if ASR_PREFLIGHT_AUDIO:
+        return ASR_PREFLIGHT_AUDIO if os.path.isabs(ASR_PREFLIGHT_AUDIO) else os.path.join(PROJECT_ROOT, ASR_PREFLIGHT_AUDIO)
+
+    candidates = []
+    for case in cases:
+        if os.path.exists(case.audio_path):
+            candidates.append(case.audio_path)
+    if os.path.isdir(AUDIO_DIR):
+        for name in os.listdir(AUDIO_DIR):
+            path = os.path.join(AUDIO_DIR, name)
+            if os.path.isfile(path):
+                candidates.append(path)
+    if not candidates:
+        return None
+    return min(set(candidates), key=os.path.getsize)
+
+
+def run_asr_preflight(cases: Sequence[AsrMetricCase]) -> None:
+    """正式指标前的接口可用性检查；失败时提前中止，避免长时间空等。"""
+    if not ASR_PREFLIGHT:
+        return
+
+    audio_path = find_preflight_audio(cases)
+    if not audio_path or not os.path.exists(audio_path):
+        print("\n[ASR预检] 未找到可用短音频，跳过接口预检。", flush=True)
+        return
+
+    print(f"\n[ASR预检] 使用短样本检查接口：{os.path.basename(audio_path)}", flush=True)
+    result = transcribe_audio(audio_path)
+    if result.ok:
+        print(f"[ASR预检] 通过：HTTP {result.status_code}，耗时={result.elapsed_sec:.2f}s", flush=True)
+        return
+
+    raise AssertionError(
+        "ASR 接口预检失败，已停止正式长音频评测："
+        f"status={result.status_code}, elapsed={result.elapsed_sec:.2f}s, error={result.error or '无响应体'}"
+    )
 
 
 def fmt(value: Optional[float], digits: int = 4) -> str:
@@ -960,6 +1364,8 @@ def evaluate_snr_robustness(case: AsrMetricCase) -> List[Dict[str, Any]]:
         return rows
     if not case.audio_path.lower().endswith(".wav"):
         return rows
+    if not is_pcm_16bit_wav(case.audio_path):
+        return rows
     if np is None:
         return rows
 
@@ -997,31 +1403,31 @@ def evaluate_snr_robustness(case: AsrMetricCase) -> List[Dict[str, Any]]:
 def save_result_csv(metrics: Sequence[Dict[str, Any]], output_path: str) -> None:
     """保存明细结果，便于后续做趋势分析。"""
     fields = [
-        "case",
-        "audio",
-        "reference",
-        "hypothesis",
-        "duration_sec",
-        "elapsed_sec",
-        "cer",
-        "wer",
-        "bertscore_f1",
-        "hallucination",
-        "rtf",
-        "first_char_latency_sec",
-        "tail_latency_sec",
-        "offline_tail_latency_sec",
-        "punctuation_acc",
-        "punctuation_precision",
-        "punctuation_recall",
-        "punctuation_f1",
-        "itn_acc",
-        "entity_acc",
-        "missed_entities",
-        "peak_process_rss_mb",
-        "peak_cpu_percent",
-        "peak_gpu_memory_mb",
-        "peak_gpu_util_percent",
+        "样本名称",
+        "音频路径",
+        "参考文本",
+        "识别文本",
+        "音频时长(秒)",
+        "请求耗时(秒)",
+        "字错误率(CER)",
+        "词错误率(WER)",
+        "BERTScore-F1",
+        "幻觉率",
+        "实时率(RTF)",
+        "首字延迟(秒)",
+        "尾字延迟(秒)",
+        "离线尾延迟(秒)",
+        "标点序列准确率",
+        "标点精确率",
+        "标点召回率",
+        "标点F1",
+        "数字/金额token准确率",
+        "实体准确率",
+        "未命中实体",
+        "进程内存峰值(MB)",
+        "CPU峰值(%)",
+        "GPU显存峰值(MB)",
+        "GPU利用率峰值(%)",
     ]
     with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
@@ -1029,35 +1435,33 @@ def save_result_csv(metrics: Sequence[Dict[str, Any]], output_path: str) -> None
         for item in metrics:
             case: AsrMetricCase = item["case"]
             result: TranscribeResult = item["result"]
-            writer.writerow(
-                {
-                    "case": case.display_name,
-                    "audio": case.audio_path,
-                    "reference": case.reference,
-                    "hypothesis": result.text,
-                    "duration_sec": item["duration_sec"],
-                    "elapsed_sec": result.elapsed_sec,
-                    "cer": item["cer"],
-                    "wer": item["wer"],
-                    "bertscore_f1": item["bertscore_f1"],
-                    "hallucination": item["hallucination"],
-                    "rtf": item["rtf"],
-                    "first_char_latency_sec": item["first_char_latency_sec"],
-                    "tail_latency_sec": item["tail_latency_sec"],
-                    "offline_tail_latency_sec": item["offline_tail_latency_sec"],
-                    "punctuation_acc": item["punctuation_acc"],
-                    "punctuation_precision": item["punctuation_precision"],
-                    "punctuation_recall": item["punctuation_recall"],
-                    "punctuation_f1": item["punctuation_f1"],
-                    "itn_acc": item["itn_acc"],
-                    "entity_acc": item["entity_acc"],
-                    "missed_entities": "；".join(item["missed_entities"]),
-                    "peak_process_rss_mb": result.resource.peak_process_rss_mb,
-                    "peak_cpu_percent": result.resource.peak_cpu_percent,
-                    "peak_gpu_memory_mb": result.resource.peak_gpu_memory_mb,
-                    "peak_gpu_util_percent": result.resource.peak_gpu_util_percent,
-                }
-            )
+            writer.writerow({
+                "样本名称": case.display_name,
+                "音频路径": case.audio_path,
+                "参考文本": case.reference,
+                "识别文本": result.text,
+                "音频时长(秒)": item["duration_sec"],
+                "请求耗时(秒)": result.elapsed_sec,
+                "字错误率(CER)": item["cer"],
+                "词错误率(WER)": item["wer"],
+                "BERTScore-F1": item["bertscore_f1"],
+                "幻觉率": item["hallucination"],
+                "实时率(RTF)": item["rtf"],
+                "首字延迟(秒)": item["first_char_latency_sec"],
+                "尾字延迟(秒)": item["tail_latency_sec"],
+                "离线尾延迟(秒)": item["offline_tail_latency_sec"],
+                "标点序列准确率": item["punctuation_acc"],
+                "标点精确率": item["punctuation_precision"],
+                "标点召回率": item["punctuation_recall"],
+                "标点F1": item["punctuation_f1"],
+                "数字/金额token准确率": item["itn_acc"],
+                "实体准确率": item["entity_acc"],
+                "未命中实体": "；".join(item["missed_entities"]),
+                "进程内存峰值(MB)": result.resource.peak_process_rss_mb,
+                "CPU峰值(%)": result.resource.peak_cpu_percent,
+                "GPU显存峰值(MB)": result.resource.peak_gpu_memory_mb,
+                "GPU利用率峰值(%)": result.resource.peak_gpu_util_percent,
+            })
 
 
 def run_precision_suite() -> List[Dict[str, Any]]:
@@ -1068,12 +1472,22 @@ def run_precision_suite() -> List[Dict[str, Any]]:
 
     print("\nASR 指标测试配置")
     print(f"API_URL={API_URL}")
-    print(f"ASR_MODEL={ASR_MODEL}, LANGUAGE={LANGUAGE}, TIMEOUT={REQUEST_TIMEOUT_SEC}s")
+    print(
+        f"ASR_MODEL={ASR_MODEL}, LANGUAGE={LANGUAGE}, "
+        f"CONNECT_TIMEOUT={ASR_CONNECT_TIMEOUT_SEC}s, READ_TIMEOUT={REQUEST_TIMEOUT_SEC}s"
+    )
+    print(
+        f"ASR_REQUEST_MODE={ASR_REQUEST_MODE}, "
+        f"ASR_EXTRACT_AUDIO_ONLY={ASR_EXTRACT_AUDIO_ONLY}, ASR_USE_DATA_URI={ASR_USE_DATA_URI}"
+    )
+    print(f"ASR_PREFLIGHT={ASR_PREFLIGHT}, ASR_PREFLIGHT_AUDIO={ASR_PREFLIGHT_AUDIO or '自动选择最小音频'}")
     print(f"CONSISTENCY_RUNS={CONSISTENCY_RUNS}, RUN_SNR_ROBUSTNESS={RUN_SNR_ROBUSTNESS}")
     print(f"WER 分词器={'jieba' if jieba is not None else '字符级回退（建议安装 jieba）'}")
-    print(f"BERTScore={'已启用' if bert_score_score is not None else '未安装 bert_score，相关列输出 N/A'}")
+    print("BERTScore=按需加载（仅在 ASR 成功且需要计算语义指标时加载）")
     print(f"实体匹配模式={ENTITY_MATCH_MODE}（substring 为兼容模式，exact_token 可降低子串误判）")
     print("格式化序列准确率说明：仅衡量数字/金额/日期等 token 序列编辑距离，不代表真正 ITN 转化效果。")
+
+    run_asr_preflight(cases)
 
     metrics = [evaluate_case(case) for case in cases]
 
@@ -1246,4 +1660,8 @@ def test_asr_precision_metrics(capsys: Any) -> None:
 
 
 if __name__ == "__main__":
-    run_precision_suite()
+    try:
+        run_precision_suite()
+    except AssertionError as exc:
+        print(f"\n[ASR测试失败] {exc}", file=sys.stderr)
+        sys.exit(1)
