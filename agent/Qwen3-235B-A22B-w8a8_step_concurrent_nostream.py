@@ -1100,6 +1100,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if not args.app_key:
+        raise ValueError("--app-key 或环境变量 APP_KEY 不能为空")
+    if not args.secret_key:
+        raise ValueError("--secret-key 或环境变量 SECRET_KEY 不能为空")
     if args.concurrent is not None and args.concurrent <= 0:
         raise ValueError("--concurrent 必须大于 0")
     if args.total is not None and args.total <= 0:
