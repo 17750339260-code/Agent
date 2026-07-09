@@ -1,30 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-ASR 大模型组件精度/性能/稳定性指标测试脚本。
+指标更准：标点处理差异化（CER 保留数字符号、实体保留标点、幻觉防误判）
 
-运行方式：
-  pytest test_asr/test_asr_precision.py -s -v
-  python test_asr/test_asr_precision.py
+兼容更多格式：自动抽音轨，视频/假 WAV 转 PCM 上传
 
-推荐提供人工标注文件，才能精确计算 CER/WER/BERTScore/实体/标点/ITN 等依赖
-参考文本的指标。默认读取：
-  test_asr/asr_precision_manifest.json
+请求灵活：支持 multipart 和 data URI 上传
 
-manifest 示例：
-[
-  {
-    "audio": "test_asr/asr_test_audio/123.wav",
-    "reference": "这里填写人工校对后的标准转写文本",
-    "key_entities": ["南方电网", "不在岗", "35岁"],
-    "is_hallucination_probe": false
-  },
-  {
-    "audio": "test_asr/asr_test_audio/silence.wav",
-    "reference": "",
-    "key_entities": [],
-    "is_hallucination_probe": true
-  }
-]
+防傻等：启动前用小文件预检接口
+
+时间戳修复：毫秒判断阈值从 >1000 秒改为 >86400 秒，杜绝误缩放
+
+按需加载：BERTScore 延迟导入，支持 jieba 自定义词典
 """
 
 from __future__ import annotations
