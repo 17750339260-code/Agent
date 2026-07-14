@@ -279,6 +279,9 @@ class StepResult:
     p99_response_ms: Optional[float]
     min_response_ms: Optional[float]
     max_response_ms: Optional[float]
+    avg_all_request_ms: Optional[float]
+    p95_all_request_ms: Optional[float]
+    p99_all_request_ms: Optional[float]
     avg_ttfb_ms: Optional[float]
     p95_ttfb_ms: Optional[float]
     avg_ttft_ms: Optional[float]
@@ -287,6 +290,14 @@ class StepResult:
     token_usage_coverage: float
     output_token_throughput: Optional[float]
     error_summary: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class ModeRunResult:
+    stream: bool
+    steps: list[StepResult]
+    breaking: Optional[tuple[int, str]]
+    report_files: dict[str, Path] = field(default_factory=dict)
 
 
 def make_headers(app_key: str, secret_key: str) -> dict[str, str]:
@@ -570,6 +581,7 @@ class GatewayConcurrentTester:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.payload = make_payload(args)
+        self.payload_bytes = json.dumps(self.payload, ensure_ascii=False).encode("utf-8")
         self.ssl_context = None if args.verify_ssl else ssl._create_unverified_context()
 
     def send_request(
@@ -595,7 +607,7 @@ class GatewayConcurrentTester:
         try:
             request = urllib.request.Request(
                 self.args.url,
-                data=json.dumps(self.payload, ensure_ascii=False).encode("utf-8"),
+                data=self.payload_bytes,
                 headers=make_headers(self.args.app_key, self.args.secret_key),
                 method="POST",
             )
@@ -741,40 +753,62 @@ class GatewayConcurrentTester:
         last_json: Any = None
         usage_source: Any = None
 
-        first = response.read(1)
-        if first:
+        # SSE event data may span multiple `data:` lines; process only complete events.
+        event_data_lines: list[str] = []
+        first_byte = response.read(1)
+        if first_byte:
             first_byte_ms = (time.perf_counter() - start_perf) * 1000
-            first_line = first + response.readline()
+            pending_line = first_byte + response.readline()
         else:
-            first_line = b""
+            pending_line = b""
 
-        while True:
-            raw_line = first_line if first_line else response.readline()
-            first_line = b""
-            if not raw_line:
-                break
+        while raw_line := (pending_line or response.readline()):
+            pending_line = b""
             response_bytes += len(raw_line)
-            line = raw_line.decode("utf-8", errors="replace").strip()
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
             if not line:
+                if not event_data_lines:
+                    continue
+                event_data = "\n".join(event_data_lines)
+                event_data_lines.clear()
+                if event_data == "[DONE]":
+                    break
+                stream_events += 1
+                event = parse_json(event_data)
+                ok, error = validate_body(event)
+                if not ok:
+                    raise RuntimeError(error)
+                last_json = event
+                if find_usage(event) is not None:
+                    usage_source = event
+                text = pick_text(event)
+                if text:
+                    output_parts.append(text)
+                    if first_token_ms is None:
+                        first_token_ms = (time.perf_counter() - start_perf) * 1000
                 continue
             if line.startswith("data:"):
-                line = line[5:].strip()
-            if not line or line == "[DONE]":
-                break
+                event_data_lines.append(line[5:].lstrip())
+            elif not line.startswith(":") and not event_data_lines:
+                # Support gateways that return newline-delimited JSON rather than SSE.
+                event_data_lines.append(line)
 
-            stream_events += 1
-            event = parse_json(line)
-            ok, error = validate_body(event)
-            if not ok:
-                raise RuntimeError(error)
-            last_json = event
-            if usage_source is None and find_usage(event) is not None:
-                usage_source = event
-            text = pick_text(event)
-            if text:
-                output_parts.append(text)
-                if first_token_ms is None:
-                    first_token_ms = (time.perf_counter() - start_perf) * 1000
+        if event_data_lines:
+            event_data = "\n".join(event_data_lines)
+            if event_data != "[DONE]":
+                stream_events += 1
+                event = parse_json(event_data)
+                ok, error = validate_body(event)
+                if not ok:
+                    raise RuntimeError(error)
+                last_json = event
+                if find_usage(event) is not None:
+                    usage_source = event
+                text = pick_text(event)
+                if text:
+                    output_parts.append(text)
+                    if first_token_ms is None:
+                        first_token_ms = (time.perf_counter() - start_perf) * 1000
 
         return response_bytes, stream_events, first_byte_ms, first_token_ms, output_parts, usage_source or last_json
 
@@ -879,13 +913,16 @@ def summarize_step(
     success = [item for item in results if item.success]
     failed = [item for item in results if not item.success]
     sent_results = [item for item in results if item.send_perf > 0]
-    if sent_results:
-        effective_start = min(item.send_perf for item in sent_results)
-        effective_end = max(item.send_perf + item.total_ms / 1000 for item in sent_results)
-        effective_duration = max(effective_end - effective_start, 0.0)
-    else:
-        effective_duration = 0.0
+    # Exclude configured idle time between bursts from the QPS measurement window.
+    burst_durations: list[float] = []
+    for burst_id in {item.burst_id for item in sent_results}:
+        burst_results = [item for item in sent_results if item.burst_id == burst_id]
+        burst_start = min(item.send_perf for item in burst_results)
+        burst_end = max(item.send_perf + item.total_ms / 1000 for item in burst_results)
+        burst_durations.append(max(burst_end - burst_start, 0.0))
+    effective_duration = sum(burst_durations)
     response_times = [item.total_ms for item in success]
+    all_request_times = [item.total_ms for item in sent_results]
     ttfb_times = [item.first_byte_ms for item in success if item.first_byte_ms is not None]
     ttft_times = [item.first_token_ms for item in success if item.first_token_ms is not None]
     completion_tokens = [
@@ -893,8 +930,8 @@ def summarize_step(
     ]
     total_completion_tokens = sum(completion_tokens)
     token_coverage = (len(completion_tokens) / len(success) * 100) if success else 0.0
+    usage_complete = bool(success) and len(completion_tokens) == len(success)
     error_summary = Counter(normalize_error(item.error) for item in failed)
-    burst_sizes = Counter(item.burst_id for item in results)
 
     return StepResult(
         concurrency=concurrency,
@@ -910,10 +947,7 @@ def summarize_step(
         total_qps=(len(sent_results) / effective_duration) if effective_duration > 0 else 0.0,
         configured_concurrency=concurrency,
         observed_peak_inflight=observed_peak,
-        full_concurrency_bursts=sum(
-            1 for burst_id in range(1, burst_rounds + 1)
-            if burst_sizes[burst_id] >= concurrency
-        ),
+        full_concurrency_bursts=total_requests // concurrency,
         avg_response_ms=average(response_times),
         p50_response_ms=percentile(response_times, 50),
         p90_response_ms=percentile(response_times, 90),
@@ -921,6 +955,9 @@ def summarize_step(
         p99_response_ms=percentile(response_times, 99),
         min_response_ms=min(response_times) if response_times else None,
         max_response_ms=max(response_times) if response_times else None,
+        avg_all_request_ms=average(all_request_times),
+        p95_all_request_ms=percentile(all_request_times, 95),
+        p99_all_request_ms=percentile(all_request_times, 99),
         avg_ttfb_ms=average(ttfb_times),
         p95_ttfb_ms=percentile(ttfb_times, 95),
         avg_ttft_ms=average(ttft_times),
@@ -929,7 +966,7 @@ def summarize_step(
         token_usage_coverage=token_coverage,
         output_token_throughput=(
             total_completion_tokens / effective_duration
-            if effective_duration > 0 and completion_tokens
+            if effective_duration > 0 and usage_complete
             else None
         ),
         error_summary=dict(error_summary),
@@ -958,19 +995,25 @@ def print_step_report(step: StepResult) -> None:
     print(f"有效压测耗时: {step.effective_duration_s:.2f}s")
     print(f"总QPS/成功QPS: {step.total_qps:.2f}/{step.success_qps:.2f} (基于有效压测耗时)")
     print(
-        "响应耗时: "
+        "成功请求响应耗时: "
         f"avg={format_ms(step.avg_response_ms)}, "
         f"p50={format_ms(step.p50_response_ms)}, "
         f"p95={format_ms(step.p95_response_ms)}, "
         f"p99={format_ms(step.p99_response_ms)}, "
         f"max={format_ms(step.max_response_ms)}"
     )
+    print(
+        "全部已发送请求端到端耗时: "
+        f"avg={format_ms(step.avg_all_request_ms)}, "
+        f"p95={format_ms(step.p95_all_request_ms)}, "
+        f"p99={format_ms(step.p99_all_request_ms)}"
+    )
     print(f"TTFB: avg={format_ms(step.avg_ttfb_ms)}, p95={format_ms(step.p95_ttfb_ms)}")
     print(f"TTFT(stream文本首包): avg={format_ms(step.avg_ttft_ms)}, p95={format_ms(step.p95_ttft_ms)}")
     print(
         "输出 token 吞吐: "
         f"{format_number(step.output_token_throughput, ' tok/s')} "
-        f"(基于有效压测耗时, usage覆盖率={step.token_usage_coverage:.2f}%)"
+        f"(仅 usage 完整覆盖时计算，usage覆盖率={step.token_usage_coverage:.2f}%)"
     )
     if step.error_summary:
         print("失败原因统计:")
@@ -1013,17 +1056,20 @@ def build_final_report(
     else:
         level_text = ", ".join(str(step.concurrency) for step in steps)
         effective_break_confirmations = 1 if len(steps) == 1 else args.break_confirmations
-    healthy_steps = [
-        step for step in steps if step.success_rate >= args.success_threshold
+    stable_steps = [
+        step
+        for step in steps
+        if step.success_rate >= args.success_threshold
+        and (breaking is None or step.concurrency < breaking[0])
     ]
-    best_healthy_qps = max(healthy_steps, key=lambda item: item.success_qps) if healthy_steps else None
+    best_stable_qps = max(stable_steps, key=lambda item: item.success_qps) if stable_steps else None
     best_observed_qps = max(steps, key=lambda item: item.success_qps) if steps else None
-    last_healthy = healthy_steps[-1] if healthy_steps else None
+    last_stable = stable_steps[-1] if stable_steps else None
 
     if breaking:
         limit_text = (
             f"首次拐点/极限风险出现在并发 {breaking[0]}：{breaking[1]}。"
-            f"建议把稳定并发上限暂定为 {last_healthy.concurrency if last_healthy else 'N/A'}。"
+            f"建议把稳定并发上限暂定为 {last_stable.concurrency if last_stable else 'N/A'}。"
         )
     else:
         limit_text = (
@@ -1031,13 +1077,14 @@ def build_final_report(
         )
 
     lines = [
-        "# Qwen3-VL-32B-Instruct 阶梯并发测试报告",
+        "# Qwen3 阶梯并发测试报告",
         "",
         f"- 生成时间: {now}",
         f"- URL: {args.url}",
         f"- 模型: {args.model}",
         f"- componentCode: {args.component_code}",
         f"- stream: {args.stream}",
+        f"- 模式执行方式: {mode_execution_name(args)}",
         f"- 请求计划: {format_request_plan(args)}",
         f"- 并发级别: {level_text}",
         f"- 成功率阈值: {args.success_threshold:.2f}%",
@@ -1047,11 +1094,11 @@ def build_final_report(
         "",
         f"- {limit_text}",
     ]
-    if best_healthy_qps:
+    if best_stable_qps:
         lines.append(
-            f"- 最佳达标成功QPS: 并发 {best_healthy_qps.concurrency}，"
-            f"成功QPS={best_healthy_qps.success_qps:.2f}，"
-            f"成功率={best_healthy_qps.success_rate:.2f}%，P95={format_ms(best_healthy_qps.p95_response_ms)}。"
+            f"- 最佳稳定成功QPS: 并发 {best_stable_qps.concurrency}，"
+            f"成功QPS={best_stable_qps.success_qps:.2f}，"
+            f"成功率={best_stable_qps.success_rate:.2f}%，P95={format_ms(best_stable_qps.p95_response_ms)}。"
         )
     elif best_observed_qps:
         lines.append(
@@ -1063,17 +1110,17 @@ def build_final_report(
         [
             "- 口径说明: 每个同步批次会先创建好请求对象并等待全部 worker 就绪，再统一释放发起网络请求；"
             "响应耗时从释放后开始统计，包含网络传输、服务端处理和响应读取。",
-            "- 总耗时包含同一阶梯内各 burst 之间的等待间隔；有效压测耗时从第一个请求实际发出到最后一个已发出请求完成，"
-            "QPS 和 token 吞吐均基于有效压测耗时计算。",
+            "- 总耗时包含同一阶梯内各 burst 之间的等待间隔；有效压测耗时为各 burst 从首个请求发出到最后一个请求完成的时长之和，"
+            "不含 burst 之间的空闲等待，QPS 和 token 吞吐均基于该时长计算。",
             "- TTFB 为响应体首字节耗时；TTFT 仅在 stream=True 且首次出现有效文本增量时统计；"
-            "token 吞吐只基于接口返回 usage 的请求统计，并用 usage 覆盖率说明可信度。",
+            "token 吞吐仅在所有成功请求均返回 completion token usage 时统计；否则显示 N/A，避免部分 usage 导致失真。",
             f"- 拐点确认: 本次按连续 {effective_break_confirmations} 个阶梯触发风险条件确认拐点；"
             "若成功率低于提前停止阈值，则直接确认当前风险点。",
             "",
             "## 阶梯结果",
             "",
-            "| 并发 | 同步批次 | 满并发批次 | 实际峰值 | 请求数 | 成功率 | 总耗时 | 有效压测耗时 | 总QPS | 成功QPS | P95响应 | P99响应 | P95 TTFB | P95 TTFT | token吞吐 | usage覆盖率 |",
-            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| 并发 | 同步批次 | 满并发批次 | 实际峰值 | 请求数 | 成功率 | 总耗时 | 有效压测耗时 | 总QPS | 成功QPS | 成功P95响应 | 全请求P95端到端 | 成功P99响应 | 全请求P99端到端 | P95 TTFB | P95 TTFT | token吞吐 | usage覆盖率 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for step in steps:
@@ -1082,7 +1129,8 @@ def build_final_report(
             f"{step.full_concurrency_bursts} | {step.observed_peak_inflight} | {step.attempted_requests} | "
             f"{step.success_rate:.2f}% | {step.total_duration_s:.2f}s | {step.effective_duration_s:.2f}s | "
             f"{step.total_qps:.2f} | {step.success_qps:.2f} | {format_ms(step.p95_response_ms)} | "
-            f"{format_ms(step.p99_response_ms)} | {format_ms(step.p95_ttfb_ms)} | "
+            f"{format_ms(step.p95_all_request_ms)} | {format_ms(step.p99_response_ms)} | "
+            f"{format_ms(step.p99_all_request_ms)} | {format_ms(step.p95_ttfb_ms)} | "
             f"{format_ms(step.p95_ttft_ms)} | {format_number(step.output_token_throughput, ' tok/s')} | "
             f"{step.token_usage_coverage:.2f}% |"
         )
@@ -1099,16 +1147,34 @@ def format_request_plan(args: argparse.Namespace) -> str:
     return "每档至少 {0} 个请求；不足满批次时自动补齐到当前并发整数倍".format(args.total)
 
 
+def stream_mode_name(stream: bool) -> str:
+    return "流式" if stream else "非流式"
+
+
+def stream_mode_file_label(stream: bool) -> str:
+    return "stream" if stream else "non_stream"
+
+
+def mode_execution_name(args: argparse.Namespace) -> str:
+    if args.parallel_stream_modes:
+        return "流式与非流式同时压测（每种模式各使用配置的并发）"
+    if args.both_stream_modes:
+        return "流式与非流式依次压测"
+    return "单模式压测"
+
+
 def write_reports(
     args: argparse.Namespace,
     steps: list[StepResult],
     details: list[RequestResult],
     breaking: Optional[tuple[int, str]],
+    report_label: str = "",
 ) -> dict[str, Path]:
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    prefix = f"qwen3_vl_concurrent_{timestamp}"
+    label_suffix = f"_{report_label}" if report_label else ""
+    prefix = f"qwen3_vl_concurrent{label_suffix}_{timestamp}"
     summary_csv = report_dir / f"{prefix}_summary.csv"
     detail_csv = report_dir / f"{prefix}_details.csv"
     markdown = report_dir / f"{prefix}_report.md"
@@ -1135,8 +1201,67 @@ def write_reports(
     return files
 
 
+def build_comparison_report(args: argparse.Namespace, mode_runs: list[ModeRunResult]) -> str:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "# Qwen3 流式与非流式对比报告",
+        "",
+        f"- 生成时间: {now}",
+        f"- URL: {args.url}",
+        f"- 模型: {args.model}",
+        f"- componentCode: {args.component_code}",
+        f"- 请求计划: {format_request_plan(args)}",
+        f"- 成功率阈值: {args.success_threshold:.2f}%",
+        f"- 模式执行方式: {mode_execution_name(args)}",
+        "- 注意: 同时压测时两种模式会共享网关和模型资源；表中每种模式的并发均为单独配置值，总入口并发约为两者之和。",
+        "",
+        "## 对比摘要",
+        "",
+        "| 模式 | 已测并发 | 首次拐点/风险 | 建议稳定并发上限 | 最佳达标成功QPS | 对应P95响应 |",
+        "|---|---|---|---:|---:|---:|",
+    ]
+    for mode_run in mode_runs:
+        stable_steps = [
+            step
+            for step in mode_run.steps
+            if step.success_rate >= args.success_threshold
+            and (mode_run.breaking is None or step.concurrency < mode_run.breaking[0])
+        ]
+        best_stable_qps = max(stable_steps, key=lambda item: item.success_qps) if stable_steps else None
+        levels = ", ".join(str(step.concurrency) for step in mode_run.steps) or "N/A"
+        breaking = (
+            f"并发 {mode_run.breaking[0]}: {mode_run.breaking[1]}"
+            if mode_run.breaking
+            else "本次范围内未触发"
+        )
+        stable_limit = stable_steps[-1].concurrency if stable_steps else "N/A"
+        best_qps = f"{best_stable_qps.success_qps:.2f}" if best_stable_qps else "N/A"
+        p95 = format_ms(best_stable_qps.p95_response_ms) if best_stable_qps else "N/A"
+        lines.append(
+            f"| {stream_mode_name(mode_run.stream)} | {levels} | {breaking} | "
+            f"{stable_limit} | {best_qps} | {p95} |"
+        )
+
+    lines.extend(["", "## 模式报告", ""])
+    for mode_run in mode_runs:
+        lines.append(f"### {stream_mode_name(mode_run.stream)}")
+        for name, path in mode_run.report_files.items():
+            lines.append(f"- {name}: {path}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write_comparison_report(args: argparse.Namespace, mode_runs: list[ModeRunResult]) -> Path:
+    report_dir = Path(args.report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    comparison_report = report_dir / f"qwen3_vl_concurrent_stream_comparison_{timestamp}.md"
+    comparison_report.write_text(build_comparison_report(args, mode_runs) + "\n", encoding="utf-8")
+    return comparison_report
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Qwen3-VL-32B-Instruct 阶梯并发压测脚本（仅使用 Python 标准库）")
+    parser = argparse.ArgumentParser(description="Qwen3 阶梯并发压测脚本（仅使用 Python 标准库）")
     parser.add_argument("--app-key", default=APP_KEY)
     parser.add_argument("--secret-key", default=SECRET_KEY)
     parser.add_argument("--url", default=URL)
@@ -1147,6 +1272,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image", action="append", help="可选图片路径，可重复传入；默认纯文本请求")
     parser.add_argument("--stream", dest="stream", action="store_true", default=True)
     parser.add_argument("--no-stream", dest="stream", action="store_false")
+    parser.add_argument(
+        "--both-stream-modes",
+        "--all-stream-modes",
+        dest="both_stream_modes",
+        action="store_true",
+        help="同一次运行中依次测试流式和非流式；忽略 --stream/--no-stream 的单模式选择",
+    )
+    parser.add_argument(
+        "--parallel-stream-modes",
+        action="store_true",
+        help="流式和非流式同时压测；每种模式各使用配置的并发，网关总并发约为两者之和",
+    )
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--timeout", type=float, default=600)
@@ -1169,6 +1306,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if args.both_stream_modes and args.parallel_stream_modes:
+        raise ValueError("--both-stream-modes 和 --parallel-stream-modes 不能同时使用")
     if args.concurrent is not None and args.concurrent <= 0:
         raise ValueError("--concurrent 必须大于 0")
     if args.total is not None and args.total <= 0:
@@ -1222,27 +1361,15 @@ def resolve_total_requests(args: argparse.Namespace, concurrency: int) -> int:
     return requested
 
 
-def main() -> int:
-    args = parse_args()
-    try:
-        validate_args(args)
-    except ValueError as exc:
-        print(f"参数错误: {exc}", file=sys.stderr)
-        return 2
-
+def run_mode_test(
+    args: argparse.Namespace,
+    levels: list[int],
+) -> tuple[list[StepResult], list[RequestResult], Optional[tuple[int, str]]]:
     tester = GatewayConcurrentTester(args)
     if args.print_payload:
-        print("请求 payload:")
+        print(f"{stream_mode_name(args.stream)}请求 payload:")
         print(json.dumps(tester.payload, ensure_ascii=False, indent=2))
-
-    if args.concurrent:
-        levels = [args.concurrent]
-    elif has_custom_concurrency_range(sys.argv):
-        levels = list(range(args.start_concurrent, args.max_concurrent + 1, args.step))
-    else:
-        levels = DEFAULT_CONCURRENCY_LEVELS
-
-    print("\nQwen3-VL-32B-Instruct 阶梯并发测试")
+    print(f"\nQwen3 阶梯并发测试（{stream_mode_name(args.stream)}）")
     print(f"目标URL: {args.url}")
     print(f"并发级别: {levels}")
     print(f"请求计划: {format_request_plan(args)}")
@@ -1299,12 +1426,55 @@ def main() -> int:
         if level != levels[-1] and args.concurrent is None:
             time.sleep(2)
 
-    files = write_reports(args, all_steps, all_details, breaking)
-    report_text = build_final_report(args, all_steps, breaking, files)
-    print("\n" + "=" * 72)
-    print(report_text)
-    print("=" * 72)
-    return 0 if all_steps and all(step.success_count > 0 for step in all_steps) else 1
+    return all_steps, all_details, breaking
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        print(f"参数错误: {exc}", file=sys.stderr)
+        return 2
+
+    if args.concurrent:
+        levels = [args.concurrent]
+    elif has_custom_concurrency_range(sys.argv):
+        levels = list(range(args.start_concurrent, args.max_concurrent + 1, args.step))
+    else:
+        levels = DEFAULT_CONCURRENCY_LEVELS
+
+    test_both_modes = args.both_stream_modes or args.parallel_stream_modes
+    stream_modes = [True, False] if test_both_modes else [args.stream]
+    mode_runs: list[ModeRunResult] = []
+
+    def run_and_report(stream: bool) -> ModeRunResult:
+        mode_args = argparse.Namespace(**vars(args), stream=stream)
+        steps, details, breaking = run_mode_test(mode_args, levels)
+        report_label = stream_mode_file_label(stream) if test_both_modes else ""
+        files = write_reports(mode_args, steps, details, breaking, report_label)
+        report_text = build_final_report(mode_args, steps, breaking, files)
+        print("\n" + "=" * 72)
+        print(report_text)
+        print("=" * 72)
+        return ModeRunResult(stream, steps, breaking, files)
+
+    if args.parallel_stream_modes:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(run_and_report, stream) for stream in stream_modes]
+            mode_runs = [future.result() for future in futures]
+    else:
+        for stream in stream_modes:
+            mode_runs.append(run_and_report(stream))
+
+    if test_both_modes:
+        comparison_report = write_comparison_report(args, mode_runs)
+        print(f"\n流式与非流式对比报告: {comparison_report}")
+
+    return 0 if all(
+        mode_run.steps and all(step.success_count > 0 for step in mode_run.steps)
+        for mode_run in mode_runs
+    ) else 1
 
 
 if __name__ == "__main__":
