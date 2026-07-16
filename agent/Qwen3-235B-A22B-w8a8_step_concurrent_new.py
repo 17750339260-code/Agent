@@ -24,7 +24,12 @@ from email.utils import formatdate
 from pathlib import Path
 from typing import Any, Optional
 
-# 云南-AI面试项目调用
+# APP_KEY = os.getenv("APP_KEY", "1001300033")
+# SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
+# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100567")
+# MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
+# 云南AI面试
 APP_KEY = os.getenv("APP_KEY", "1001300035")
 SECRET_KEY = os.getenv("SECRET_KEY", "68bbe87e123b40089c4196a30b435bbc")
 URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
@@ -1449,7 +1454,9 @@ def main() -> int:
     mode_runs: list[ModeRunResult] = []
 
     def run_and_report(stream: bool) -> ModeRunResult:
-        mode_args = argparse.Namespace(**vars(args), stream=stream)
+        mode_args_dict = vars(args).copy()
+        mode_args_dict["stream"] = stream
+        mode_args = argparse.Namespace(**mode_args_dict)
         steps, details, breaking = run_mode_test(mode_args, levels)
         report_label = stream_mode_file_label(stream) if test_both_modes else ""
         files = write_reports(mode_args, steps, details, breaking, report_label)
