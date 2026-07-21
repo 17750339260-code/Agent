@@ -9,7 +9,7 @@ import soundfile as sf
 API_URL = "http://36.111.82.53:10017/v1/audio/trans"
 # Get the project root directory (assuming script is in app4npu/)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AUDIO_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "61.wav")
+AUDIO_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "2.wav")
 
 def generate_dummy_mp3(filename):
     """
@@ -59,35 +59,6 @@ def test_mp3_input():
         "hotwords": "测试 MP3"
     }
     send_request(payload)
-
-    # Case 3: File Path (Server-side path)
-    # Ignored because server is remote
-    
-    # Case 4: Multipart File Upload (Real File Transfer)
-    # print(f"\n--- Test Case 4: Multipart File Upload ---")
-    # files = {
-    #     "file": ("test1.wav", open(AUDIO_FILE, "rb"), "audio/wav")
-    # }
-    # data = {
-    #     "model": "funasr-iic",
-    #     "hotwords": "测试文件上传"
-    # }
-    # # Note: Using a different endpoint for file upload
-    # upload_url = API_URL.replace("/trans", "/transcriptions_file") # Hacky URL switch
-    
-    # try:
-    #     print(f"Uploading to {upload_url}...")
-    #     resp = requests.post(upload_url, files=files, data=data)
-    #     if resp.status_code == 200:
-    #         print("✅ Success:")
-    #         print(json.dumps(resp.json(), indent=2, ensure_ascii=False))
-    #     else:
-    #         print(f"❌ Error {resp.status_code}:")
-    #         print(resp.text)
-    # except Exception as e:
-    #     print(f"Upload failed: {e}")
-    # finally:
-    #     files["file"][1].close()
 
 def send_request(payload):
     try:
