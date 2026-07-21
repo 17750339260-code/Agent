@@ -10,7 +10,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "61.wav")
 MP4_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "")
 MP3_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "6.mp3")
-
+OGG_FILE = os.path.join(PROJECT_ROOT, "test_asr", "asr_test_audio", "test01.ogg")
 def send_request(payload):
     try:
         resp = requests.post(API_URL, json=payload)
@@ -176,6 +176,30 @@ def test_case6_mp3_data_uri_upload():
         "model": "funasr-iic",
         "input_type": "stream",
         "input": data_uri,
+    }
+    result = send_request(payload)
+    assert result is not None, "请求失败，未获得有效响应"
+def test_case7_base64_upload():
+    """OGG音频文件纯Base64编码上传测试"""
+    print(f"Reading {OGG_FILE}...")
+    if not os.path.exists(OGG_FILE):
+        print(f"❌ File not found: {OGG_FILE}")
+        pytest.skip("音频文件不存在，跳过测试")
+
+    with open(OGG_FILE, "rb") as f:
+        audio_data = f.read()
+
+    b64_data = base64.b64encode(audio_data).decode("utf-8")
+    ext = os.path.splitext(OGG_FILE)[1][1:].lower()
+    if not ext:
+        ext = "ogg"
+
+    print(f"\n--- Test Case 1: Minimal params (implicit default model='funasr-iic', input_type='stream') ---")
+    payload = {
+        "model": "funasr-iic",
+        "input_type": "stream",
+        "input": b64_data,
+        "hotwords": ""
     }
     result = send_request(payload)
     assert result is not None, "请求失败，未获得有效响应"
