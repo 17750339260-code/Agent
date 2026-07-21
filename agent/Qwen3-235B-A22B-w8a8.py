@@ -15,16 +15,35 @@ import requests
 import urllib3
 from urllib3.exceptions import InsecureRequestWarning
 
-# AI面试
-APP_KEY = os.getenv("APP_KEY", "1001300035")
-SECRET_KEY = os.getenv("SECRET_KEY", "68bbe87e123b40089c4196a30b435bbc")
-# URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
+#多模态解析大模型 - Qwen2.5-Omni-7B AI课程开发
+APP_KEY = os.getenv("APP_KEY", "1001300037")
+SECRET_KEY = os.getenv("SECRET_KEY", "360ce63f5625412ba78d0aed3458b53a")
 URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
-COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04101188")
-MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
-# MODEL = os.getenv("MODEL", "Qwen3-VL")
+COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100831")
+MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
+
+# 自然语言大模型 - Qwen3-8B  AI学习助手
+# APP_KEY = os.getenv("APP_KEY", "1001300037")
+# SECRET_KEY = os.getenv("SECRET_KEY", "360ce63f5625412ba78d0aed3458b53a")
+# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100832")
+# MODEL = os.getenv("MODEL", "Qwen3-8B")
+
+# 多模态解析大模型 - Qwen2.5-Omni-7B  AI画像
+# APP_KEY = os.getenv("APP_KEY", "1001300037")
+# SECRET_KEY = os.getenv("SECRET_KEY", "360ce63f5625412ba78d0aed3458b53a")
+# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100844")
+# MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
+
+# 多模态解析大模型 - Qwen2.5-Omni-7B AI考试助手
+# APP_KEY = os.getenv("APP_KEY", "1000391300008")
+# SECRET_KEY = os.getenv("SECRET_KEY", "2f8b0c48355f4eaf9766067442c8928e")
+# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100856")
+# MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
+
 SYSTEM_PROMPT = "你是一个严谨的电网面试助手，请严格遵守用户要求并仅输出合法结果。"
-# SYSTEM_PROMPT = "你是一个优秀的历史学家。"
 USER_PROMPT = """
 # 角色定义
 资深电网国企面试官，擅长从候选人**真实工作经历、业务成果、解决问题的方法**中提炼考察点，尤其擅长出"压力场景+短板验证"类行为面试题。
@@ -399,7 +418,7 @@ def request_once(args: argparse.Namespace) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Qwen3-VL 网关请求脚本")
+    parser = argparse.ArgumentParser(description="模型网关请求脚本")
     parser.add_argument("--app-key", default=APP_KEY)
     parser.add_argument("--secret-key", default=SECRET_KEY)
     parser.add_argument("--url", default=URL)
