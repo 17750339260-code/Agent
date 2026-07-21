@@ -38,9 +38,14 @@ import requests
 from tqdm import tqdm
 
 
+# DEFAULT_MODEL = "Qwen2.5-Omni-7B"
+# DEFAULT_COMPONENT_CODE = "04350560"
+# DEFAULT_URL = "https://192.168.0.213:18300/ai-inference-gateway/predict"
+
 DEFAULT_MODEL = "Qwen2.5-Omni-7B"
-DEFAULT_COMPONENT_CODE = "04350560"
-DEFAULT_URL = "https://192.168.0.213:18300/ai-inference-gateway/predict"
+DEFAULT_COMPONENT_CODE = "04100831"
+DEFAULT_URL = "https://10.10.65.213:18300/ai-inference-gateway/predict"
+
 DEFAULT_IMAGE_DIR = str(Path(__file__).resolve().parent / "images")
 MAX_CONTEXT_TOKENS = 32_000
 
@@ -1215,8 +1220,8 @@ def main() -> None:
         url=args.url,
         # app_key=args.app_key,
         # secret_key=args.secret_key,
-        app_key="1001300033",
-        secret_key="24e74daf74124b0b96c9cb113162a976",
+        app_key="1001300037",
+        secret_key="360ce63f5625412ba78d0aed3458b53a",
         component_code=args.component_code,
         model=args.model,
         image_dir=args.image_dir,
