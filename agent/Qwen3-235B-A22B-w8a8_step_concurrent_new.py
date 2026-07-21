@@ -26,16 +26,24 @@ from typing import Any, Optional
 
 # APP_KEY = os.getenv("APP_KEY", "1001300033")
 # SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
-# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+# URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
 # COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100567")
 # MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
-# 云南AI面试
-APP_KEY = os.getenv("APP_KEY", "1001300035")
-SECRET_KEY = os.getenv("SECRET_KEY", "68bbe87e123b40089c4196a30b435bbc")
+
+# APP_KEY = os.getenv("APP_KEY", "1001300035")
+# SECRET_KEY = os.getenv("SECRET_KEY", "68bbe87e123b40089c4196a30b435bbc")
+# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04101188")
+# MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
+# 智学
+APP_KEY = os.getenv("APP_KEY", "1001300033")
+SECRET_KEY = os.getenv("SECRET_KEY", "24e74daf74124b0b96c9cb113162a976")
 URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
-COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04101188")
+COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100567")
 MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
-DEFAULT_CONCURRENCY_LEVELS = [2,4,8,12,16,20,22,24,26,28,30,32,34,36,38,40]
+
+# DEFAULT_CONCURRENCY_LEVELS = [2,4,8,12,16,20,22,24,26,28,30,32,34,36,38,40]
+DEFAULT_CONCURRENCY_LEVELS = [10,20,30,40,50,60,70,80,90,100,110,120]
 DEFAULT_SYSTEM_PROMPT = "你是一个严谨的测试助手，请根据用户要求给出清晰、可验证的回答。"
 DEFAULT_USER_PROMPT = """
 # 角色定义
