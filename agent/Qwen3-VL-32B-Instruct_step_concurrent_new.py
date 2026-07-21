@@ -24,14 +24,21 @@ from email.utils import formatdate
 from pathlib import Path
 from typing import Any, Optional
 
+#
+# APP_KEY = os.getenv("APP_KEY", "1001300035")
+# SECRET_KEY = os.getenv("SECRET_KEY", "68bbe87e123b40089c4196a30b435bbc")
+# # URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
+# URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
+# COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04101188")
+# MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
 
-APP_KEY = os.getenv("APP_KEY", "1001300035")
-SECRET_KEY = os.getenv("SECRET_KEY", "68bbe87e123b40089c4196a30b435bbc")
+APP_KEY = os.getenv("APP_KEY", "1001300037")
+SECRET_KEY = os.getenv("SECRET_KEY", "360ce63f5625412ba78d0aed3458b53a")
 # URL = os.getenv("GATEWAY_URL", "https://192.168.0.213:18300/ai-inference-gateway/predict")
 URL = os.getenv("GATEWAY_URL", "https://10.10.65.213:18300/ai-inference-gateway/predict")
-COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04101188")
-MODEL = os.getenv("MODEL", "Qwen3-235B-A22B-w8a8")
-# MODEL = os.getenv("MODEL", "Qwen3-VL")  #公司环境
+COMPONENT_CODE = os.getenv("COMPONENT_CODE", "04100844")
+MODEL = os.getenv("MODEL", "Qwen3-VL-32B-Instruct")
+
 DEFAULT_CONCURRENCY_LEVELS = [2,8,10,20,22,24,26,28,30,32,34,36,38,40]
 DEFAULT_SYSTEM_PROMPT = "你是一个严谨的测试助手，请根据用户要求给出清晰、可验证的回答。"
 DEFAULT_USER_PROMPT = """
