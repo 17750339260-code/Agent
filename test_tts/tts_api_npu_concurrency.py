@@ -28,7 +28,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # =========================================================
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-URL = "http://36.111.82.53:10015/api/tts/instruct2"
+URL = "http://36.111.82.53:10014/v1/audio/speech"
 OUTPUT_DIR = "tts_output"
 LOG_DIR = "./logs"                # 你要存放日志的目录
 LOG_FILE = os.path.join(LOG_DIR, "tts_stability_log.csv")
