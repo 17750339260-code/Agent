@@ -73,7 +73,7 @@ MILVUS_CLIENT_TIMEOUT = 300              # 普通 RPC 客户端超时，单位�
 # None 表示索引创建/等待不设人为总时限；服务端失败或 RPC 异常仍会退出。
 INDEX_BUILD_TIMEOUT: Optional[float] = None
 EMBEDDING_DIM = 1024                     # 与固定目标 stress_test_chunks 的向量维度一致
-DEFAULT_TARGET_COUNT = 2_000_000        # 正式统计阶段默认写入 1000 万条
+DEFAULT_TARGET_COUNT = 10_000_000        # 正式统计阶段默认写入 1000 万条
 DEFAULT_BATCH_SIZE = 100                 # 单批约数 MB，兼顾吞吐和 gRPC 消息大小
 COLLECTION_MAX_ROWS = 2_000_000          # 单个 collection 的最大逻辑行数
 DEFAULT_CONCURRENCY = 8                  # 每个线程持有独立 MilvusClient
