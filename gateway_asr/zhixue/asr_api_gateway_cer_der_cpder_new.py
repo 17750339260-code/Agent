@@ -8,6 +8,8 @@ Use --mode multipart --audio for single-sample scoring. For plain UTF-8
 reference text, add --reference-file and --no-return-speaker-segments.
 Use --record-scoring-texts to export exact inputs separately from compact audits,
 or --mode legacy --audio for the original HMAC JSON gateway client.
+Use --transport direct --endpoint URL for a compatible alternate multipart
+API without gateway routing fields or HMAC authentication.
 """
 from __future__ import annotations
 
@@ -95,6 +97,7 @@ def _annotation_audit(text: str) -> dict[str, Any]:
         "unwrapped_markers": dict(Counter(m.group() for m in _AMP_ANNOTATION_RE.finditer(surface))),
         "cleaned_text_sha256": hashlib.sha256(_clean_annotation(surface).encode("utf-8")).hexdigest(),
     }
+
 
 _NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 _ALWAYS_SEMANTIC_SYMBOLS = frozenset("%‰$€¥￥+±=<>#@°℃")
@@ -371,7 +374,7 @@ def _scoring_input_audit(chars: str, words: Sequence[str]) -> dict[str, Any]:
 
 
 def _export_scoring_inputs(
-    output: Path, artifact: str, role: str, chars: str, words: Sequence[str],
+        output: Path, artifact: str, role: str, chars: str, words: Sequence[str],
 ) -> dict[str, Any]:
     """Export exact inputs separately; file hashes match the compact audit hashes."""
     cer_path = output / "scoring_inputs" / f"{artifact}-{role}.txt"
@@ -538,7 +541,8 @@ def merge_intervals(segments: Iterable[Segment]) -> list[Segment]:
             if item.start <= current.end + 1e-9:
                 current = Segment(current.start, max(current.end, item.end), speaker, current.text)
             else:
-                merged.append(current); current = item
+                merged.append(current);
+                current = item
         merged.append(current)
     return sorted(merged, key=lambda item: (item.start, item.end, item.speaker))
 
@@ -574,6 +578,7 @@ def _assignment(overlap: Mapping[tuple[str, str], float], refs: Sequence[str], s
     matrix = [[overlap.get((sys, ref), 0.0) for ref in refs] for sys in syss]
     rows, cols = linear_sum_assignment([[-value for value in row] for row in matrix])
     return {syss[row]: refs[col] for row, col in zip(rows, cols)}
+
 
 def _collar_mask(reference: Sequence[Segment], collar_sec: float,
                  collar_mode: str = "turn_boundary") -> list[tuple[float, float]]:
@@ -754,7 +759,6 @@ def as_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2, default=json_default, allow_nan=False)
 
 
-
 # --- Audio duration parsing --------------------------------------------------
 
 import json
@@ -801,7 +805,6 @@ def audio_duration(path: Path) -> float | None:
     return None
 
 
-
 # --- Multipart gateway client ------------------------------------------------
 
 
@@ -821,7 +824,6 @@ except ImportError as exc:  # pragma: no cover - exercised in packaging/CI
     _HTTPX_IMPORT_ERROR = exc
 else:
     _HTTPX_IMPORT_ERROR = None
-
 
 # Values supplied by研发.  Keep them in the evaluator so a result records the
 # same transport contract that was used in production.
@@ -895,9 +897,14 @@ class ClientConfig:
     use_proxy: bool = False
     verify_tls: bool = True
     max_response_bytes: int = 32 * 1024 * 1024
+    transport: str = "gateway"
 
     def public_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "endpoint": _safe_endpoint(self.endpoint)}
+        result = {**asdict(self), "endpoint": _safe_endpoint(self.endpoint)}
+        # Preserve the original default audit schema; record the opt-in mode.
+        if self.transport == "gateway":
+            result.pop("transport")
+        return result
 
 
 def _bool_text(value: bool) -> str:
@@ -915,7 +922,7 @@ def _safe_endpoint(endpoint: str) -> str:
         host = parts.netloc
     query = urlencode([(key, "[REDACTED]" if any(
         secret in key.lower() for secret in ("token", "secret", "password", "key", "auth", "credential"))
-        else value) for key, value in parse_qsl(parts.query, keep_blank_values=True)])
+    else value) for key, value in parse_qsl(parts.query, keep_blank_values=True)])
     return urlunsplit((parts.scheme, host, parts.path, query, ""))
 
 
@@ -940,9 +947,9 @@ def _valid_speaker(value: Any) -> bool:
 
 
 def _validate_speaker_timeline_value(
-    value: Any,
-    *,
-    audio_duration_sec: float | None = None,
+        value: Any,
+        *,
+        audio_duration_sec: float | None = None,
 ) -> list[str]:
     """Validate the strict, text-free diarization timeline wire contract."""
     errors: list[str] = []
@@ -968,8 +975,8 @@ def _validate_speaker_timeline_value(
             )
         speaker = item.get("spk")
         if (
-            not isinstance(speaker, str)
-            or _CANONICAL_TIMELINE_SPEAKER_RE.fullmatch(speaker) is None
+                not isinstance(speaker, str)
+                or _CANONICAL_TIMELINE_SPEAKER_RE.fullmatch(speaker) is None
         ):
             errors.append(
                 f"speaker_timeline[{index}].spk must be a canonical label like spk0"
@@ -981,10 +988,10 @@ def _validate_speaker_timeline_value(
         if not isinstance(end, int) or isinstance(end, bool):
             errors.append(f"speaker_timeline[{index}].end must be an integer millisecond")
         if (
-            not isinstance(start, int)
-            or isinstance(start, bool)
-            or not isinstance(end, int)
-            or isinstance(end, bool)
+                not isinstance(start, int)
+                or isinstance(start, bool)
+                or not isinstance(end, int)
+                or isinstance(end, bool)
         ):
             continue
         if start < 0 or end <= start:
@@ -1008,11 +1015,11 @@ def _validate_speaker_timeline_value(
 
 
 def validate_response_shape(
-    body: Any,
-    *,
-    require_segments: bool = True,
-    require_speaker_timeline: bool = False,
-    audio_duration_sec: float | None = None,
+        body: Any,
+        *,
+        require_segments: bool = True,
+        require_speaker_timeline: bool = False,
+        audio_duration_sec: float | None = None,
 ) -> list[str]:
     """Return protocol errors without changing the response.
 
@@ -1075,11 +1082,11 @@ def validate_response_shape(
 
 
 async def post_audio_async(
-    audio_path: str | Path,
-    manual_test_id: str,
-    config: ClientConfig,
-    *,
-    idempotency_key: str,
+        audio_path: str | Path,
+        manual_test_id: str,
+        config: ClientConfig,
+        *,
+        idempotency_key: str,
 ) -> tuple[Any, dict[str, Any]]:
     """Cancelable network I/O deadline over upload, headers and response body.
 
@@ -1088,17 +1095,17 @@ async def post_audio_async(
     """
     if httpx is None:  # pragma: no cover
         raise AsrHttpError(f"httpx is required: {_HTTPX_IMPORT_ERROR}", stage="client_config")
-    
+
     audio = Path(audio_path)
     if not audio.is_file():
         raise AsrHttpError(f"audio file not found: {audio}", stage="client_config")
     audio_bytes = audio.stat().st_size
-    
+
     if DEBUG_MODE:
         LOG.info("  → POST audio: %s (%.2f MB)", audio.name, audio_bytes / (1024 * 1024))
         LOG.info("  → Endpoint: %s", _safe_endpoint(config.endpoint))
         LOG.info("  → TLS verification: %s", config.verify_tls)
-    
+
     if audio_bytes == 0:
         raise AsrHttpError("audio file is empty", stage="client_validation")
     if audio_bytes > SERVER_LIMITS["max_encoded_audio_bytes"]:
@@ -1109,6 +1116,8 @@ async def post_audio_async(
         raise AsrHttpError(
             f"multipart request would exceed server max_request_body_bytes={SERVER_LIMITS['max_request_body_bytes']}",
             stage="client_validation")
+    if config.transport not in {"gateway", "direct"}:
+        raise AsrHttpError("transport must be gateway or direct", stage="client_config")
     if config.automatic_retries != 0:
         raise AsrHttpError("automatic_retries must be 0 for production evaluation", stage="client_config")
     if config.return_speaker_timeline and not config.speaker_diarization:
@@ -1139,16 +1148,16 @@ async def post_audio_async(
     if config.max_response_bytes <= 0:
         raise AsrHttpError("max_response_bytes must be > 0", stage="client_config")
     if (
-        not isinstance(idempotency_key, str)
-        or not idempotency_key.strip()
-        or "\r" in idempotency_key
-        or "\n" in idempotency_key
-        or len(idempotency_key) > 256
-        or re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}",
-            idempotency_key,
-        )
-        is None
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or "\r" in idempotency_key
+            or "\n" in idempotency_key
+            or len(idempotency_key) > 256
+            or re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}",
+        idempotency_key,
+    )
+            is None
     ):
         raise AsrHttpError(
             "idempotency_key must match the server ASCII key contract",
@@ -1159,16 +1168,13 @@ async def post_audio_async(
     # Phase limits cap idle I/O; asyncio owns the complete network deadline.
     effective_connect, effective_write, effective_read = (
         min(value, config.total_timeout_seconds) for value in (
-            config.connect_timeout_seconds, config.upload_write_timeout_seconds,
-            config.response_read_timeout_seconds))
+        config.connect_timeout_seconds, config.upload_write_timeout_seconds,
+        config.response_read_timeout_seconds))
     timeout = httpx.Timeout(connect=effective_connect, write=effective_write,
                             read=effective_read, pool=effective_connect)
     params = {"manual_test_id": manual_test_id}
-    # 研发 multipart 协议要求这些文本字段；Content-Type 不手工设置，
-    # 交给 httpx 自动生成带 boundary 的 multipart/form-data。
+    # 两种传输共用 ASR 字段及音频文件；Content-Type 由 httpx 生成 boundary。
     data = {
-        "componentCode": ASR_COMPONENTCODE,
-        "function": config.model,
         "model": config.model,
         "language": config.language,
         "hotwords": config.hotwords,
@@ -1176,6 +1182,9 @@ async def post_audio_async(
         "is_return_timestamp": _bool_text(config.is_return_timestamp),
         "return_speaker_segments": _bool_text(config.return_speaker_segments),
     }
+    if config.transport == "gateway":
+        # 保持原网关字段及顺序；备用 API 不接收这两个路由字段。
+        data = {"componentCode": ASR_COMPONENTCODE, "function": config.model, **data}
     if config.return_speaker_timeline:
         data["return_speaker_timeline"] = "true"
     if config.speaker_text_attribution_mode == "moss_text_v1":
@@ -1208,21 +1217,23 @@ async def post_audio_async(
         },
         "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    # 网关采用 x-date + HMAC-SHA256 鉴权。每次请求重新签名，避免复用过期签名。
-    x_date, authorization = getLocalAuthInfo(ASR_CUSTCODE, ASR_BINDING_API_KEY)
+    if config.transport != "gateway":
+        request_meta["transport"] = config.transport
     headers = {
-        "x-date": x_date,
-        "authorization": authorization,
         "Idempotency-Key": idempotency_key,
         "Accept": "application/json",
         "Expect": "",
         "X-Accel-Buffering": "no",
         "Cache-Control": "no-cache",
     }
-    
+    if config.transport == "gateway":
+        # 每次网关请求重新签名；备用传输不读取网关凭证，也不调用签名函数。
+        x_date, authorization = getLocalAuthInfo(ASR_CUSTCODE, ASR_BINDING_API_KEY)
+        headers = {"x-date": x_date, "authorization": authorization, **headers}
+
     if DEBUG_MODE:
         LOG.info("  → Connecting to server...")
-    
+
     file_handle = audio.open("rb")
     try:
         async with asyncio.timeout(max(0.0, config.total_timeout_seconds - (time.monotonic() - started))):
@@ -1240,15 +1251,17 @@ async def post_audio_async(
                 async with httpx.AsyncClient(**client_kwargs) as client:
                     if DEBUG_MODE:
                         LOG.info("  → Sending multipart request...")
-                    async with client.stream("POST", _endpoint_without_manual_id(config.endpoint), params=params, data=data,
-                                       files=files, headers=headers) as response:
+                    async with client.stream("POST", _endpoint_without_manual_id(config.endpoint), params=params,
+                                             data=data,
+                                             files=files, headers=headers) as response:
                         headers_elapsed = time.monotonic() - started
                         request_meta["time_to_response_headers_sec"] = headers_elapsed
                         request_meta["status_code"] = response.status_code
-                        
+
                         if DEBUG_MODE:
-                            LOG.info("  → Response headers received (%.2fs, HTTP %d)", headers_elapsed, response.status_code)
-                        
+                            LOG.info("  → Response headers received (%.2fs, HTTP %d)", headers_elapsed,
+                                     response.status_code)
+
                         if headers_elapsed > config.total_timeout_seconds:
                             raise AsrHttpError("client total timeout exceeded", stage="client_total_timeout",
                                                status_code=response.status_code)
@@ -1309,10 +1322,11 @@ async def post_audio_async(
                         request_meta["response_bytes"] = len(raw)
                         request_meta["response_sha256"] = _sha256_bytes(raw)
                         request_meta["total_elapsed_sec"] = time.monotonic() - started
-                        
+
                         if DEBUG_MODE:
-                            LOG.info("  → Response complete: %d bytes in %.2fs", len(raw), request_meta["total_elapsed_sec"])
-                        
+                            LOG.info("  → Response complete: %d bytes in %.2fs", len(raw),
+                                     request_meta["total_elapsed_sec"])
+
                         if not 200 <= response.status_code < 300:
                             excerpt = raw[:4096].decode("utf-8", errors="replace")
                             raise AsrHttpError(
@@ -1327,8 +1341,8 @@ async def post_audio_async(
                         request_meta["protocol_errors"] = validate_response_shape(
                             body,
                             require_segments=(
-                                config.return_speaker_segments
-                                or config.speaker_text_attribution_mode == "moss_text_v1"
+                                    config.return_speaker_segments
+                                    or config.speaker_text_attribution_mode == "moss_text_v1"
                             ),
                             require_speaker_timeline=config.return_speaker_timeline,
                         )
@@ -1390,9 +1404,6 @@ def post_audio(audio_path: str | Path, manual_test_id: str, config: ClientConfig
     raise AsrHttpError("running event loop: await post_audio_async instead", stage="client_config")
 
 
-
-
-
 # --- Dataset runner and reporting --------------------------------------------
 
 
@@ -1415,21 +1426,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 LOG = logging.getLogger("asr-eval")
 TIMESTAMP_UNITS = ("auto", "ms", "s")
 
 
 def percentile(values: list[float], percent: float) -> float:
     """使用 nearest-rank 返回真实观测样本，避免小样本插值低估尾延迟。
-    
+
     这是生产契约定义：ordered[max(1, ceil(percent/100 * N)) - 1]
     """
     if not values:
         raise ValueError("values must not be empty")
     if not 0 <= percent <= 100:
         raise ValueError("percent must be in [0, 100]")
-    
+
     ordered = sorted(values)
     rank = max(1, math.ceil(percent / 100.0 * len(ordered)))
     return ordered[rank - 1]
@@ -1483,11 +1493,11 @@ def _extract_segment_list(body: Any) -> list[dict[str, Any]]:
 
 
 def _speaker_quality_summary(
-    body: Any,
-    system_segments: Sequence[Segment],
-    transcript: str,
-    *, strip_punctuation: bool = True, order: str = "response",
-    consistency: Mapping[str, Any] | None = None,
+        body: Any,
+        system_segments: Sequence[Segment],
+        transcript: str,
+        *, strip_punctuation: bool = True, order: str = "response",
+        consistency: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Summarize speaker coverage; label raw and normalized conservation separately."""
     unknown = [item for item in system_segments if item.speaker == UNKNOWN_SPEAKER_LABEL]
@@ -1509,9 +1519,9 @@ def _speaker_quality_summary(
         ]
     )
     ordered_text_matches = (
-        consistency["transcript_valid"] and consistency["segments_text_valid"]
-        and len(ordered_texts) == len(raw_segments)
-        and "".join(ordered_texts) == transcript
+            consistency["transcript_valid"] and consistency["segments_text_valid"]
+            and len(ordered_texts) == len(raw_segments)
+            and "".join(ordered_texts) == transcript
     )
     return {
         "order": order,
@@ -1534,10 +1544,9 @@ def _speaker_quality_summary(
     }
 
 
-
 def _segment_text_consistency(
-    body: Any, segments: Sequence[Segment], *, order: str,
-    strip_punctuation: bool,
+        body: Any, segments: Sequence[Segment], *, order: str,
+        strip_punctuation: bool,
 ) -> dict[str, Any]:
     """Audit ordered CER units and WER units separately, without bag/tolerance.
 
@@ -1564,7 +1573,7 @@ def _segment_text_consistency(
     tokens_match = segment_tokens == transcript_tokens
     inputs_valid = transcript_valid and segments_valid
     match_grade = ("invalid_input" if not inputs_valid else "character_mismatch" if not chars_match
-                   else "exact" if tokens_match else "word_boundary_only")
+    else "exact" if tokens_match else "word_boundary_only")
     return {
         "order": order,
         "contract": "cpCER requires exact ordered normalized characters; WER token boundaries audited separately",
@@ -1580,7 +1589,9 @@ def _segment_text_consistency(
         "overlap_linearization": "explicit selected order; no inferred cross-speaker permutation",
     }
 
-def _system_segments(body: Any, duration: float | None, timestamp_unit: str) -> tuple[list[Segment], dict[str, Any], list[str]]:
+
+def _system_segments(body: Any, duration: float | None, timestamp_unit: str) -> tuple[
+    list[Segment], dict[str, Any], list[str]]:
     """Validate timestamps and convert the API contract to seconds.
 
     ``auto`` compares both interpretations against the measured audio duration.
@@ -1595,19 +1606,29 @@ def _system_segments(body: Any, duration: float | None, timestamp_unit: str) -> 
     raw_max_end = 0.0
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
-            invalid_count += 1; errors.append(f"segment[{index}] is not an object"); continue
+            invalid_count += 1;
+            errors.append(f"segment[{index}] is not an object");
+            continue
         start = _number(item.get("start", item.get("begin", item.get("start_time"))))
         end = _number(item.get("end", item.get("finish", item.get("end_time"))))
         speaker = item.get("spk", item.get("speaker", item.get("speaker_id", item.get("speakerId", ""))))
         text = item.get("text", item.get("sentence", item.get("content", "")))
         if start is None or end is None:
-            invalid_count += 1; errors.append(f"segment[{index}] has non-numeric start/end"); continue
+            invalid_count += 1;
+            errors.append(f"segment[{index}] has non-numeric start/end");
+            continue
         if not _valid_speaker(speaker):
-            invalid_count += 1; errors.append(f"segment[{index}] has empty speaker"); continue
+            invalid_count += 1;
+            errors.append(f"segment[{index}] has empty speaker");
+            continue
         if not isinstance(text, str):
-            invalid_count += 1; errors.append(f"segment[{index}] text is not a string"); continue
+            invalid_count += 1;
+            errors.append(f"segment[{index}] text is not a string");
+            continue
         if start < 0 or end <= start:
-            invalid_count += 1; errors.append(f"segment[{index}] invalid interval [{start}, {end}]"); continue
+            invalid_count += 1;
+            errors.append(f"segment[{index}] invalid interval [{start}, {end}]");
+            continue
         raw_max_end = max(raw_max_end, end)
         result.append(Segment(start, end, str(speaker).strip(), text))
 
@@ -1626,7 +1647,8 @@ def _system_segments(body: Any, duration: float | None, timestamp_unit: str) -> 
             ms_error = abs(raw_max_end / 1000.0 - duration) / max(duration, 1.0)
             used = "ms" if ms_error < sec_error else "s"
             if min(sec_error, ms_error) > AUTO_TIMESTAMP_TAIL_TOLERANCE:
-                errors.append("timestamp_unit=auto: neither unit matches the audio tail within 2%; use explicit ms/s; speaker metrics blocked")
+                errors.append(
+                    "timestamp_unit=auto: neither unit matches the audio tail within 2%; use explicit ms/s; speaker metrics blocked")
             if abs(ms_error - sec_error) < 0.05:
                 # A close tie means the evaluator cannot establish the unit
                 # from evidence.  Do not publish DER/cpDER for an arbitrary
@@ -1643,9 +1665,11 @@ def _system_segments(body: Any, duration: float | None, timestamp_unit: str) -> 
     # allowing most short utterances to occupy only part of the file.
     if duration is not None and converted_max_end > 0:
         if converted_max_end > duration * 10.0 + 1.0:
-            errors.append(f"converted timestamps exceed audio duration by >10x: {converted_max_end:.6f}s > {duration:.6f}s")
+            errors.append(
+                f"converted timestamps exceed audio duration by >10x: {converted_max_end:.6f}s > {duration:.6f}s")
         elif duration >= 5.0 and converted_max_end < max(0.05, duration * 0.005):
-            warnings.append("very short speech coverage; explicit timestamp unit is trusted, not inferred from coverage")
+            warnings.append(
+                "very short speech coverage; explicit timestamp unit is trusted, not inferred from coverage")
 
     clipped_count = 0
     if duration is not None:
@@ -1694,8 +1718,8 @@ def _union_coverage_sec(segments: Sequence[Segment]) -> float:
 
 
 def _speaker_timeline_segments(
-    body: Any,
-    duration: float | None,
+        body: Any,
+        duration: float | None,
 ) -> tuple[list[Segment], dict[str, Any], list[str]]:
     """Return strict MOSS timeline intervals converted from integer ms to seconds."""
     raw = body.get("speaker_timeline") if isinstance(body, dict) else None
@@ -1732,7 +1756,8 @@ def _speaker_timeline_segments(
     return result, metadata, errors
 
 
-def _reference_paths(dataset: Path, stem: str, reference_dir: Path | None, rttm_dir: Path | None) -> tuple[Path | None, Path | None]:
+def _reference_paths(dataset: Path, stem: str, reference_dir: Path | None, rttm_dir: Path | None) -> tuple[
+    Path | None, Path | None]:
     text_root, rttm_root = reference_dir or dataset / "TextGrid", rttm_dir or dataset / "TextGrid"
     textgrid, rttm = text_root / f"{stem}.TextGrid", rttm_root / f"{stem}.rttm"
     return (textgrid if textgrid.exists() else None, rttm if rttm.exists() else None)
@@ -1803,9 +1828,9 @@ def _load_offline_response(offline_dir: Path, audio: Path, dataset: Path, stem: 
             if bound_path.resolve() != candidate.resolve():
                 raise ValueError("offline provenance raw artifact path mismatch")
         source_verified = (
-            source_request.get("provenance_verified") is not False
-            and (source_request.get("mode") != "offline"
-                 or source_request.get("provenance_verified") is True)
+                source_request.get("provenance_verified") is not False
+                and (source_request.get("mode") != "offline"
+                     or source_request.get("provenance_verified") is True)
         )
         verified = (provenance.get("audio_sha256") == audio_hash
                     and provenance.get("raw_response_sha256") == raw_hash
@@ -1814,7 +1839,8 @@ def _load_offline_response(offline_dir: Path, audio: Path, dataset: Path, stem: 
             raise ValueError("offline provenance incomplete; use --allow-unverified-offline for diagnostic replay only")
         metadata = {"mode": "offline", "succeeded": True, "provenance_verified": verified,
                     "provenance_scope": "saved audio/raw artifact consistency; not remote service attestation",
-                    "source_raw": str(candidate.resolve()), "source_record": str(sidecar.resolve()) if sidecar else None,
+                    "source_raw": str(candidate.resolve()),
+                    "source_record": str(sidecar.resolve()) if sidecar else None,
                     "audio_sha256": audio_hash, "raw_response_sha256": raw_hash,
                     "source_raw_response_sha256": raw_hash,
                     "source_request": source_request,
@@ -1830,7 +1856,8 @@ def _audio_duration(audio: Path) -> float | None:
         return None
 
 
-def _request_one(audio: Path, args: argparse.Namespace, index: int, limiter: "RateLimiter | None" = None) -> tuple[Any | None, dict[str, Any]]:
+def _request_one(audio: Path, args: argparse.Namespace, index: int, limiter: "RateLimiter | None" = None) -> tuple[
+    Any | None, dict[str, Any]]:
     digest = sha256_file(audio)
     manual_test_id_base = f"manual-{uuid.uuid4().hex[:12]}-{index:04d}-{digest[:12]}"
     idempotency_key = f"asr-{manual_test_id_base.removeprefix('manual-')}"
@@ -1852,9 +1879,11 @@ def _request_one(audio: Path, args: argparse.Namespace, index: int, limiter: "Ra
         total_timeout_seconds=args.total_timeout, automatic_retries=0,
         follow_redirects=False, http_version="HTTP/1.1", use_proxy=args.use_proxy,
         verify_tls=not args.insecure, max_response_bytes=args.max_response_bytes,
+        transport=getattr(args, "transport", "gateway"),
     )
     audio_duration = _audio_duration(audio)
-    LOG.info("  → Requesting ASR for %s (duration: %s)", audio.name, f"{audio_duration:.2f}s" if audio_duration else "unknown")
+    LOG.info("  → Requesting ASR for %s (duration: %s)", audio.name,
+             f"{audio_duration:.2f}s" if audio_duration else "unknown")
     if audio_duration is not None and audio_duration > SERVER_LIMITS["max_asr_audio_seconds"]:
         return None, {
             "succeeded": False, "manual_test_id_base": manual_test_id_base,
@@ -1896,11 +1925,13 @@ def _request_one(audio: Path, args: argparse.Namespace, index: int, limiter: "Ra
         except AsrHttpError as exc:
             attempts.append({**exc.metadata, "manual_test_id": manual_test_id, "succeeded": False,
                              "error_stage": exc.stage, "error": str(exc)})
-            last = {**last, **exc.metadata, "attempt": attempt, "manual_test_id": manual_test_id, "succeeded": False, "error": str(exc),
+            last = {**last, **exc.metadata, "attempt": attempt, "manual_test_id": manual_test_id, "succeeded": False,
+                    "error": str(exc),
                     "error_stage": exc.stage, "status_code": exc.status_code}
             if attempt <= args.retries and _is_retryable_asr_http_error(exc):
                 delay = args.retry_backoff * (2 ** (attempt - 1))
-                LOG.warning("%s failed (%d/%d) stage=%s, retrying in %.1fs: %s", audio.name, attempt, args.retries + 1, exc.stage, delay, exc)
+                LOG.warning("%s failed (%d/%d) stage=%s, retrying in %.1fs: %s", audio.name, attempt, args.retries + 1,
+                            exc.stage, delay, exc)
                 if delay >= deadline - time.monotonic():
                     last["error"] = "request budget exhausted before retry"
                     last["error_stage"] = "client_total_timeout"
@@ -1941,7 +1972,6 @@ class RateLimiter:
 
 METRIC_KEYS = ("cer", "wer", "der", "cpder", "cpcer")
 
-
 QUALITY_METRIC_KEYS = ("cer", "wer", "der", "cpcer")  # cpDER is a DER alias
 
 
@@ -1967,6 +1997,7 @@ def _evaluation_exit_code(summary: Mapping[str, Any], *, require_quality_gate: b
     if require_quality_gate and summary.get("acceptance_ready") is not True:
         return 2
     return 0
+
 
 def _metric_value(row: Mapping[str, Any], key: str) -> float | None:
     obj = row.get(key)
@@ -2060,7 +2091,8 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
         "speaker_text_attribution_mode": getattr(
             args, "speaker_text_attribution_mode", "legacy_overlap"
         ),
-        "normalization_version": NORMALIZATION_VERSION, "service_version": getattr(args, "service_version", "unknown"), "source_code_sha256": sha256_file(__file__), "status": "failed", "errors": [],
+        "normalization_version": NORMALIZATION_VERSION, "service_version": getattr(args, "service_version", "unknown"),
+        "source_code_sha256": sha256_file(__file__), "status": "failed", "errors": [],
         "warnings": [], "quality_warnings": [], "metrics_complete": False,
         "evaluation_mode": "full" if segments_mode else ("timeline" if timeline_mode else "text_only"),
         "expected_metrics": expected, "metric_unavailable": {},
@@ -2116,7 +2148,8 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
         record["errors"].append(f"missing reference TextGrid for {stem}")
     if speaker_mode and rttm_path is None:
         record["errors"].append(f"missing reference RTTM for {stem}")
-    if ((textgrid_path is None and reference_file is None) or (speaker_mode and rttm_path is None)) and not args.allow_missing_reference:
+    if ((textgrid_path is None and reference_file is None) or (
+            speaker_mode and rttm_path is None)) and not args.allow_missing_reference:
         unavailable(expected, "missing required reference; use --allow-missing-reference for partial scoring")
         return _finalize_record(record)
     if duration is None:
@@ -2193,7 +2226,7 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
         record["timestamp"] = ts_meta
         record["warnings"].extend(ts_meta.get("warnings", []))
         record["errors"].extend(ts_errors)
-        
+
         # Add segment validity summary for audit
         record["segment_validity_summary"] = {
             "raw_count": ts_meta.get("raw_segment_count", 0),
@@ -2201,7 +2234,7 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
             "invalid_count": ts_meta.get("invalid_segment_count", 0),
             "clipped_count": ts_meta.get("clipped_segment_count", 0),
         }
-        
+
         consistency = _segment_text_consistency(
             body, system_segments, order=getattr(args, "segment_text_order", "response"),
             strip_punctuation=args.strip_punctuation,
@@ -2303,9 +2336,9 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
         unavailable(["cer", "wer"], "invalid/missing reference transcript or response text; denominator may be empty")
     if speaker_mode:
         if (
-            reference_rttm_valid
-            and diarization_segments_valid
-            and duration is not None
+                reference_rttm_valid
+                and diarization_segments_valid
+                and duration is not None
         ):
             try:
                 der = score_diarization(
@@ -2326,9 +2359,9 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
         # cpCER depends on TextGrid speaker text, NOT RTTM. Bad RTTM alone cannot
         # invalidate otherwise sound cpCER; timing DER is independently blocked.
         if (
-            segments_mode
-            and segments_valid
-            and reference_text_valid
+                segments_mode
+                and segments_valid
+                and reference_text_valid
         ):
             try:
                 cpcer = score_cpcer(ref_text_segments, system_segments, strip_punctuation=args.strip_punctuation)
@@ -2344,9 +2377,9 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
     record["metric_eligibility"] = {key: "diagnostic" for key in METRIC_KEYS if key in record}
     reasons = record.setdefault("metric_diagnostic_reasons", {})
     global_protocol_valid = not any(not (
-        e.startswith("segments") or "field: segments" in e or "field segments" in e or
-        e.startswith("speaker_timeline") or "field: speaker_timeline" in e or
-        "field speaker_timeline" in e) for e in protocol_errors)
+            e.startswith("segments") or "field: segments" in e or "field segments" in e or
+            e.startswith("speaker_timeline") or "field: speaker_timeline" in e or
+            "field speaker_timeline" in e) for e in protocol_errors)
 
     def qualify(keys: Sequence[str], checks: Sequence[tuple[bool, str]]) -> None:
         failures = [reason for valid, reason in checks if not valid]
@@ -2387,17 +2420,22 @@ def _score_one(audio: Path, body: Any, dataset: Path, args: argparse.Namespace, 
 
 def _aggregate(records: list[dict[str, Any]], args: argparse.Namespace) -> dict[str, Any]:
     rows = [x for x in records if x.get("available_metrics")]
+
     def items(key: str, eligibility: str = "accepted") -> list[dict[str, Any]]:
         return [x[key] for x in records if isinstance(x.get(key), dict)
                 and x.get("metric_eligibility", {}).get(key) == eligibility]
+
     def vals(key: str, eligibility: str = "accepted") -> list[float]:
         return [value for x in records if x.get("metric_eligibility", {}).get(key) == eligibility
                 and (value := _metric_value(x, key)) is not None]
+
     def mean(key: str) -> float | None:
         values = vals(key)
         return sum(values) / len(values) if values else None
+
     def p95(values: list[float]) -> float | None:
         return percentile(values, 95) if values else None
+
     def totals(key: str, eligibility: str = "accepted") -> dict[str, Any]:
         metric_rows = items(key, eligibility)
         if key in {"der", "cpder"}:
@@ -2414,9 +2452,11 @@ def _aggregate(records: list[dict[str, Any]], args: argparse.Namespace) -> dict[
             unit = "words" if key == "wer" else "characters"
         return {"sample_count": len(metric_rows), "errors": numerator,
                 "reference_units": denominator, "unit": unit, **components}
+
     def micro(key: str, eligibility: str = "accepted") -> float | None:
         total = totals(key, eligibility)
         return total["errors"] / total["reference_units"] if total["reference_units"] else None
+
     der_rows = items("der")
     den = math.fsum(x["reference_speech_time"] for x in der_rows)
     miss = math.fsum(x["miss"] for x in der_rows)
@@ -2447,12 +2487,12 @@ def _aggregate(records: list[dict[str, Any]], args: argparse.Namespace) -> dict[
     thresholds = _quality_limits(args)
     missing_thresholds = [key for key in expected if key != "cpder" and key not in thresholds]
     gate_checks = {key: {"limit": limit, "micro": (value := micro(key)),
-                        "passed": (value <= limit if metrics_complete and value is not None else None)}
+                         "passed": (value <= limit if metrics_complete and value is not None else None)}
                    for key, limit in thresholds.items()}
     gate_passed = (all(x["passed"] is True for x in gate_checks.values())
                    if thresholds and metrics_complete else None)
     gate_status = ("unconfigured" if not thresholds else "incomplete_metrics" if not metrics_complete
-                   else "failed" if not gate_passed else "incomplete_thresholds" if missing_thresholds else "passed")
+    else "failed" if not gate_passed else "incomplete_thresholds" if missing_thresholds else "passed")
     acceptance_ready = metrics_complete and gate_passed is True and not missing_thresholds
     return {
         "scorer_version": SCORER_VERSION, "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -2487,8 +2527,10 @@ def _aggregate(records: list[dict[str, Any]], args: argparse.Namespace) -> dict[
         "metric_rate_sample_counts": {key: len(vals(key)) for key in METRIC_KEYS},
         "zero_reference_statistics": {
             key: {"sample_count": len(zero := [x for x in items(key)
-                       if x.get("reference_units", x.get("reference_speech_time")) == 0]),
-                  "errors": sum(x.get("errors", x.get("miss", 0) + x.get("false_alarm", 0) + x.get("confusion", 0)) for x in zero)}
+                                               if x.get("reference_units", x.get("reference_speech_time")) == 0]),
+                  "errors": sum(
+                      x.get("errors", x.get("miss", 0) + x.get("false_alarm", 0) + x.get("confusion", 0)) for x in
+                      zero)}
             for key in METRIC_KEYS},
         "percentile_method": "nearest-rank: ordered[max(1, ceil(percent/100 * N)) - 1]",
         "total_response_bytes": sum(int(x.get("response_bytes", 0)) for x in request_attempts),
@@ -2527,7 +2569,8 @@ def _aggregate(records: list[dict[str, Any]], args: argparse.Namespace) -> dict[
         "annotation_schema": dict(ANNOTATION_SCHEMA),
         "segment_text_order": getattr(args, "segment_text_order", "response"),
         "record_scoring_texts": getattr(args, "record_scoring_texts", False),
-        "normalization": "NFKC + lowercase + explicit annotation schema; whitespace delimits words; semantic symbols retained; punctuation " + ("removed" if args.strip_punctuation else "retained"),
+        "normalization": "NFKC + lowercase + explicit annotation schema; whitespace delimits words; semantic symbols retained; punctuation " + (
+            "removed" if args.strip_punctuation else "retained"),
         "timestamp_unit_requested": args.timestamp_unit,
         "timestamp_unit_used_counts": dict(timestamp_units),
         "timestamp_validation_counts": dict(timestamp_validations),
@@ -2569,13 +2612,13 @@ def run_evaluation_self_test() -> None:
         {"segments": [{"start": 0, "end": 2, "spk": "A", "text": "x"}]},
         2.0, "auto")
     assert not errors and meta["timestamp_unit_used"] == "s" and segments[0].end == 2.0
-    
+
     # Test basic DER without collar
     no_collar = score_diarization(
         [Segment(0, 1, "r1"), Segment(1, 2, "r2")],
         [Segment(0, 1, "s1"), Segment(1, 2, "s2")], collar_sec=0)
     assert no_collar.reference_speech_time == 2.0
-    
+
     # Test DER with collar at speaker change boundary
     # [r1][r2]: speaker changes at t=1
     # collar=0.25 excludes [0.75, 1.25]
@@ -2585,7 +2628,7 @@ def run_evaluation_self_test() -> None:
         [Segment(0, 1, "s1"), Segment(1, 2, "s2")], collar_sec=0.25, collar_mode="speaker_change")
     assert abs(with_collar.reference_speech_time - 1.5) < 1e-9, \
         f"expected 1.5, got {with_collar.reference_speech_time}"
-    
+
     # Critical test: same speaker internal split should NOT add collar
     # [r1, r1, r2] has speaker changes at t=2 only (r1 continues from 0-2)
     internal_split = score_diarization(
@@ -2595,7 +2638,7 @@ def run_evaluation_self_test() -> None:
     # Collar only at t=2: [1.75, 2.25], denominator = 3.0 - 0.5 = 2.5
     assert abs(internal_split.reference_speech_time - 2.5) < 1e-9, \
         f"internal split collar test failed: expected 2.5, got {internal_split.reference_speech_time}"
-    
+
     # Test multiple mask windows across timeline intervals
     # Reference: [r1 0-0.5], [r2 0.6-1.0], [r1 1.1-1.5]
     # System: [s1 0-0.5], [s2 0.6-1.0], [s1 1.1-1.5]
@@ -2608,7 +2651,7 @@ def run_evaluation_self_test() -> None:
     # Total reference time: 0.5 + 0.4 + 0.4 = 1.3s, excluded 0.2s = 1.1s
     assert abs(multi_mask.reference_speech_time - 1.1) < 1e-9, \
         f"multi-mask test failed: expected 1.1, got {multi_mask.reference_speech_time}"
-    
+
     assert score_cpcer(
         [Segment(0, 1, "r1", "甲"), Segment(1, 2, "r2", "乙")],
         [Segment(0, 1, "s2", "乙"), Segment(1, 2, "s1", "甲")],
@@ -2623,7 +2666,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--audio", type=Path, help="score only this audio file")
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--offline-dir", type=Path, default=None)
-    p.add_argument("--allow-unverified-offline", action="store_true", help="diagnostic replay only; cannot pass acceptance")
+    p.add_argument("--allow-unverified-offline", action="store_true",
+                   help="diagnostic replay only; cannot pass acceptance")
     p.add_argument("--service-version", default="unknown", help="operator-supplied version; not auto-verified")
     p.add_argument("--segment-text-order", choices=("response", "time"), default="response",
                    help="exact transcript conservation order, including overlap; response is wire order, time sorts (start,end,speaker)")
@@ -2635,6 +2679,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="UTF-8 plain reference text for --audio; requires text-only mode (--no-return-speaker-segments)")
     p.add_argument("--exclude", action="append", default=[])
     p.add_argument("--endpoint", default=ASR_BINDING_HOST)
+    p.add_argument("--transport", choices=("gateway", "direct"), default="gateway",
+                   help="请求传输模式：gateway 保留原网关字段和 HMAC 鉴权；direct 配合 --endpoint 使用兼容备用 API，省略 componentCode/function 和 x-date/authorization")
     p.add_argument("--model", default=ASR_MODEL)
     p.add_argument("--language", default=os.getenv("ASR_LANGUAGE", "zh"))
     p.add_argument("--hotwords", default="")
@@ -2680,7 +2726,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use-proxy", action="store_true")
     p.add_argument(
         "--insecure", action=argparse.BooleanOptionalAction,
-        default=not ASR_VERIFY_TLS if os.getenv("ASR_GATEWAY_INSECURE", "").lower() not in {"1", "true", "yes", "0", "false", "no"} else os.getenv("ASR_GATEWAY_INSECURE", "").lower() in {"1", "true", "yes"},
+        default=not ASR_VERIFY_TLS if os.getenv("ASR_GATEWAY_INSECURE", "").lower() not in {"1", "true", "yes", "0",
+                                                                                            "false",
+                                                                                            "no"} else os.getenv(
+            "ASR_GATEWAY_INSECURE", "").lower() in {"1", "true", "yes"},
         help="禁用 TLS 证书校验；仅限受信内网临时测试，也可用 ASR_GATEWAY_INSECURE=1 或修改代码中的 ASR_VERIFY_TLS",
     )
     p.add_argument("--max-in-flight", type=int, default=1)
@@ -2710,7 +2759,8 @@ def _exclusive_run_output(output: Path):
     try:
         lock = lock_path.open("x", encoding="utf-8")
     except FileExistsError as exc:
-        raise ValueError(f"output directory is in use or has a stale lock: {lock_path}; choose a new directory") from exc
+        raise ValueError(
+            f"output directory is in use or has a stale lock: {lock_path}; choose a new directory") from exc
     try:
         with lock:
             lock.write(f"pid={os.getpid()}\n")
@@ -2723,18 +2773,19 @@ def _exclusive_run_output(output: Path):
 
 
 def evaluation_main(argv: list[str] | None = None) -> int:
-    parser = build_parser(); args = parser.parse_args(argv)
+    parser = build_parser();
+    args = parser.parse_args(argv)
     if args.request_budget is not None and (not math.isfinite(args.request_budget) or args.request_budget <= 0):
         parser.error("--request-budget must be finite and > 0")
     if args.retries > 8:
         parser.error("--retries must be <= 8")
-    
+
     # Apply --debug flag to override environment variable
     # Note: Modifies global DEBUG_MODE at entry point before any parallel execution
     global DEBUG_MODE
     if hasattr(args, 'debug') and args.debug is not None:
         DEBUG_MODE = args.debug
-    
+
     if args.self_test:
         run_evaluation_self_test()
         print("evaluation self-test passed")
@@ -2769,9 +2820,11 @@ def evaluation_main(argv: list[str] | None = None) -> int:
         if args.audio is None:
             parser.error("--reference-file requires --audio (one reference file per audio)")
         if args.return_speaker_segments or args.return_speaker_timeline:
-            parser.error("--reference-file contains no speaker/timestamp annotations; use --no-return-speaker-segments without --return-speaker-timeline")
+            parser.error(
+                "--reference-file contains no speaker/timestamp annotations; use --no-return-speaker-segments without --return-speaker-timeline")
         if args.clip_reference_to_audio:
-            parser.error("--clip-reference-to-audio requires timestamped reference annotations; plain reference text cannot be clipped")
+            parser.error(
+                "--clip-reference-to-audio requires timestamped reference annotations; plain reference text cannot be clipped")
         args.reference_file = args.reference_file.resolve()
         if not args.reference_file.is_file():
             parser.error(f"reference file not found: {args.reference_file}")
@@ -2793,7 +2846,8 @@ def evaluation_main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     if not audios: parser.error(f"no supported audio files found in {args.dataset_dir}")
-    output = (args.output_dir or args.dataset_dir / "runs" / (datetime.now().strftime("%Y%m%dT%H%M%S_%f") + "-" + uuid.uuid4().hex[:8])).resolve()
+    output = (args.output_dir or args.dataset_dir / "runs" / (
+            datetime.now().strftime("%Y%m%dT%H%M%S_%f") + "-" + uuid.uuid4().hex[:8])).resolve()
     output.mkdir(parents=True, exist_ok=True)
     if (output / "summary.json").exists():
         parser.error("output-dir already contains a completed run; choose a new directory to preserve audit history")
@@ -2803,7 +2857,7 @@ def evaluation_main(argv: list[str] | None = None) -> int:
         with _exclusive_run_output(output):
             if not LOG.handlers: LOG.addHandler(logging.StreamHandler())
             LOG.setLevel(logging.INFO)
-            
+
             # Print startup information
             print("\n" + "=" * 80)
             print("ASR GATEWAY EVALUATION STARTED")
@@ -2817,21 +2871,23 @@ def evaluation_main(argv: list[str] | None = None) -> int:
             if args.offline_dir:
                 print(f"Mode:        Offline (using cached responses)")
             else:
-                print(f"Timeout:     connect={args.connect_timeout}s, upload={args.upload_write_timeout}s, read={args.response_read_timeout}s, total={args.total_timeout}s")
+                print(
+                    f"Timeout:     connect={args.connect_timeout}s, upload={args.upload_write_timeout}s, read={args.response_read_timeout}s, total={args.total_timeout}s")
                 print(f"Concurrency: {args.max_in_flight} parallel request(s)")
             print("=" * 80)
             print("")
-            
+
             records: list[dict[str, Any]] = []
             limiter = RateLimiter(args.qps)
-        
+
             def requests():
                 if args.offline_dir:
                     for index, audio in enumerate(audios, 1):
                         try:
                             body, request = _load_offline_response(
                                 args.offline_dir, audio, args.dataset_dir, canonical_stem(audio),
-                                allow_legacy_names=audio_name_counts[audio.name] == 1 and stem_counts[canonical_stem(audio)] == 1,
+                                allow_legacy_names=audio_name_counts[audio.name] == 1 and stem_counts[
+                                    canonical_stem(audio)] == 1,
                                 max_response_bytes=args.max_response_bytes,
                                 allow_unverified=args.allow_unverified_offline, return_metadata=True)
                         except Exception as exc:
@@ -2843,19 +2899,22 @@ def evaluation_main(argv: list[str] | None = None) -> int:
                         try:
                             body, request = _request_one(audio, args, index, limiter)
                         except Exception as exc:
-                            body, request = None, {"succeeded": False, "error_stage": "client_failure", "error": str(exc)}
+                            body, request = None, {"succeeded": False, "error_stage": "client_failure",
+                                                   "error": str(exc)}
                         yield index, audio, body, request
                 else:
                     # Bound outstanding tasks to worker count; scoring/output remains serialized.
                     with ThreadPoolExecutor(max_workers=args.max_in_flight) as pool:
                         pending = {}
                         source = iter(enumerate(audios, 1))
+
                         def submit_next():
                             try:
                                 index, audio = next(source)
                             except StopIteration:
                                 return
                             pending[pool.submit(_request_one, audio, args, index, limiter)] = (index, audio)
+
                         for _ in range(args.max_in_flight):
                             submit_next()
                         while pending:
@@ -2865,16 +2924,17 @@ def evaluation_main(argv: list[str] | None = None) -> int:
                                 try:
                                     body, request = future.result()
                                 except Exception as exc:
-                                    body, request = None, {"succeeded": False, "error_stage": "client_failure", "error": str(exc)}
+                                    body, request = None, {"succeeded": False, "error_stage": "client_failure",
+                                                           "error": str(exc)}
                                 submit_next()
                                 yield index, audio, body, request
-        
+
             LOG.info("=" * 80)
             LOG.info("Starting evaluation: %d audio files", len(audios))
             LOG.info("Endpoint: %s", _safe_endpoint(args.endpoint) if not args.offline_dir else "offline")
             LOG.info("Output directory: %s", output)
             LOG.info("=" * 80)
-            
+
             for index, audio, body, request in requests():
                 LOG.info("\n[%d/%d] Processing: %s", index, len(audios), audio.name)
                 LOG.info("  Audio size: %.2f MB", audio.stat().st_size / (1024 * 1024))
@@ -2893,7 +2953,7 @@ def evaluation_main(argv: list[str] | None = None) -> int:
                 _apply_request_metadata(record, request, args.service_version)
                 _json_file(output / "per_file" / f"{_artifact_name(audio, args.dataset_dir)}.json", record)
                 records.append(record)
-                
+
                 # Enhanced status output
                 LOG.info("  Results: status=%s", record.get("status"))
                 for key in METRIC_KEYS:
@@ -2967,6 +3027,8 @@ def evaluation_main(argv: list[str] | None = None) -> int:
                 "record_scoring_texts": args.record_scoring_texts,
                 "reference_file": str(args.reference_file) if args.reference_file else None,
             }
+            if args.transport != "gateway":
+                summary["run_profile"]["client_config"]["transport"] = args.transport
             # Add warnings if TLS verification is disabled
             if args.insecure:
                 summary["run_warnings"] = summary.get("run_warnings", []) + [
@@ -2991,7 +3053,7 @@ def evaluation_main(argv: list[str] | None = None) -> int:
                               json.dumps(row.get("metric_diagnostic_reasons", {}), ensure_ascii=False)])
                 rows.append("\t".join(c.replace("\t", " ").replace("\n", " ") for c in cells))
             _atomic_write(output / "per_file.tsv", "\n".join(rows) + "\n")
-            
+
             LOG.info("\n" + "=" * 80)
             LOG.info("EVALUATION COMPLETE")
             LOG.info("=" * 80)
@@ -3001,13 +3063,19 @@ def evaluation_main(argv: list[str] | None = None) -> int:
             LOG.info("Partial:          %d", summary.get("partial_count", 0))
             LOG.info("Failed:           %d", summary.get("failed_count", 0))
             LOG.info("")
-            LOG.info("CER scoring mode: %s; whitespace excluded; semantic symbols retained", summary["cer_scoring_mode"])
+            LOG.info("CER scoring mode: %s; whitespace excluded; semantic symbols retained",
+                     summary["cer_scoring_mode"])
             LOG.info("Metrics (macro averages):")
-            LOG.info("  CER:   %s", f"{summary.get('cer_macro'):.2%}" if summary.get("cer_macro") is not None else "N/A")
-            LOG.info("  WER:   %s", f"{summary.get('wer_macro'):.2%}" if summary.get("wer_macro") is not None else "N/A")
-            LOG.info("  DER:   %s", f"{summary.get('der_macro'):.2%}" if summary.get("der_macro") is not None else "N/A")
-            LOG.info("  cpDER: %s", f"{summary.get('cpder_macro'):.2%}" if summary.get("cpder_macro") is not None else "N/A")
-            LOG.info("  cpCER: %s", f"{summary.get('cpcer_macro'):.2%}" if summary.get("cpcer_macro") is not None else "N/A")
+            LOG.info("  CER:   %s",
+                     f"{summary.get('cer_macro'):.2%}" if summary.get("cer_macro") is not None else "N/A")
+            LOG.info("  WER:   %s",
+                     f"{summary.get('wer_macro'):.2%}" if summary.get("wer_macro") is not None else "N/A")
+            LOG.info("  DER:   %s",
+                     f"{summary.get('der_macro'):.2%}" if summary.get("der_macro") is not None else "N/A")
+            LOG.info("  cpDER: %s",
+                     f"{summary.get('cpder_macro'):.2%}" if summary.get("cpder_macro") is not None else "N/A")
+            LOG.info("  cpCER: %s",
+                     f"{summary.get('cpcer_macro'):.2%}" if summary.get("cpcer_macro") is not None else "N/A")
             LOG.info("=" * 80)
             LOG.info("Qualification complete: %s; quality gate: %s; acceptance_ready: %s",
                      summary["metrics_complete"], summary["quality_gate_status"], summary["acceptance_ready"])
@@ -3016,12 +3084,10 @@ def evaluation_main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
 
-
-
 # --- Original HMAC/streaming gateway compatibility ---------------------------
 # Kept in this same executable: old HMAC JSON requests and performance reporting
 # use a different wire protocol from the multipart diarization evaluator above.
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 """
 通过 AI Gateway 访问 ASR 服务的测试程序
 参考 gateway_api_npu.py 的认证方式，访问 ASR 接口
@@ -3122,6 +3188,8 @@ class AccuracyScore:
 
 # ---------------- ASR 准确率（与并发测试脚本相同的 enterprise-v2 口径） ----------------
 _CHINESE_DATE_NUM_RE = re.compile(r"([零〇一二三四五六七八九两十]{1,8})(?=[年月日号])")
+
+
 def _chinese_date_number_to_arabic(text):
     digit_map = {
         "零": "0", "〇": "0", "一": "1", "二": "2", "两": "2",
@@ -3192,9 +3260,9 @@ def normalize_asr_text(text, *, keep_spaces=False, normalize_dates=False):
 def _is_cjk_char(ch):
     code = ord(ch)
     return (
-        0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF
-        or 0x20000 <= code <= 0x2A6DF or 0x2A700 <= code <= 0x2B73F
-        or 0x2B740 <= code <= 0x2B81F or 0x2B820 <= code <= 0x2CEAF
+            0x4E00 <= code <= 0x9FFF or 0x3400 <= code <= 0x4DBF
+            or 0x20000 <= code <= 0x2A6DF or 0x2A700 <= code <= 0x2B73F
+            or 0x2B740 <= code <= 0x2B81F or 0x2B820 <= code <= 0x2CEAF
     )
 
 
@@ -3387,13 +3455,16 @@ def aggregate_accuracy(outcomes, reference_text, *, normalize_dates=False,
         "cer_samples": len(cers), "wer_samples": len(wers),
         "avg_cer": statistics.mean(cers) if cers else None,
         "p95_cer": percentile(cers, 95) if cers else None,
-        "micro_cer": cer_errors / sum(s.reference_units for s in cer_stats) if cer_stats and sum(s.reference_units for s in cer_stats) else None,
+        "micro_cer": cer_errors / sum(s.reference_units for s in cer_stats) if cer_stats and sum(
+            s.reference_units for s in cer_stats) else None,
         "avg_strict_cer": statistics.mean(strict_cers) if strict_cers else None,
         "p95_strict_cer": percentile(strict_cers, 95) if strict_cers else None,
-        "micro_strict_cer": strict_errors / sum(s.reference_units for s in strict_stats) if strict_stats and sum(s.reference_units for s in strict_stats) else None,
+        "micro_strict_cer": strict_errors / sum(s.reference_units for s in strict_stats) if strict_stats and sum(
+            s.reference_units for s in strict_stats) else None,
         "avg_wer": statistics.mean(wers) if wers else None,
         "p95_wer": percentile(wers, 95) if wers else None,
-        "micro_wer": wer_errors / sum(s.reference_units for s in wer_stats) if wer_stats and sum(s.reference_units for s in wer_stats) else None,
+        "micro_wer": wer_errors / sum(s.reference_units for s in wer_stats) if wer_stats and sum(
+            s.reference_units for s in wer_stats) else None,
         "cer_substitutions": sum(s.substitutions for s in cer_stats),
         "cer_deletions": sum(s.deletions for s in cer_stats),
         "cer_insertions": sum(s.insertions for s in cer_stats),
@@ -3422,12 +3493,18 @@ def print_accuracy_metrics(accuracy):
     fmt = lambda value: f"{value:.2%}" if value is not None else "N/A"
     print("\n[ASR ACCURACY METRICS]")
     print(f"参考文本: {accuracy['reference_text'][:80]}")
-    print(f"归一化CER: 微平均 {fmt(accuracy['micro_cer'])} | 宏平均 {fmt(accuracy['avg_cer'])} | P95 {fmt(accuracy['p95_cer'])} | 样本 {accuracy['cer_samples']}")
-    print(f"CER编辑明细: S={accuracy['cer_substitutions']} D={accuracy['cer_deletions']} I={accuracy['cer_insertions']} / N={accuracy['cer_reference_units']} | 完全匹配 {accuracy['exact_match_count']}/{accuracy['cer_samples']} ({accuracy['exact_match_rate']:.2f}%)")
-    print(f"严格CER: 微平均 {fmt(accuracy['micro_strict_cer'])} | 宏平均 {fmt(accuracy['avg_strict_cer'])} | P95 {fmt(accuracy['p95_strict_cer'])}")
-    print(f"混合词元WER: 微平均 {fmt(accuracy['micro_wer'])} | 宏平均 {fmt(accuracy['avg_wer'])} | P95 {fmt(accuracy['p95_wer'])} | 样本 {accuracy['wer_samples']}")
-    print(f"WER编辑明细: S={accuracy['wer_substitutions']} D={accuracy['wer_deletions']} I={accuracy['wer_insertions']} / N={accuracy['wer_reference_units']} | {accuracy['wer_definition']}")
-    print(f"端到端可用率: {accuracy['usable_transcript_count']}/{accuracy['accuracy_attempts']} ({accuracy['usable_transcript_rate']:.2f}%，分母含请求失败) | 成功样本内 {accuracy['conditional_usable_transcript_rate']:.2f}% | 未评分/失败 {accuracy['accuracy_failed_requests']}")
+    print(
+        f"归一化CER: 微平均 {fmt(accuracy['micro_cer'])} | 宏平均 {fmt(accuracy['avg_cer'])} | P95 {fmt(accuracy['p95_cer'])} | 样本 {accuracy['cer_samples']}")
+    print(
+        f"CER编辑明细: S={accuracy['cer_substitutions']} D={accuracy['cer_deletions']} I={accuracy['cer_insertions']} / N={accuracy['cer_reference_units']} | 完全匹配 {accuracy['exact_match_count']}/{accuracy['cer_samples']} ({accuracy['exact_match_rate']:.2f}%)")
+    print(
+        f"严格CER: 微平均 {fmt(accuracy['micro_strict_cer'])} | 宏平均 {fmt(accuracy['avg_strict_cer'])} | P95 {fmt(accuracy['p95_strict_cer'])}")
+    print(
+        f"混合词元WER: 微平均 {fmt(accuracy['micro_wer'])} | 宏平均 {fmt(accuracy['avg_wer'])} | P95 {fmt(accuracy['p95_wer'])} | 样本 {accuracy['wer_samples']}")
+    print(
+        f"WER编辑明细: S={accuracy['wer_substitutions']} D={accuracy['wer_deletions']} I={accuracy['wer_insertions']} / N={accuracy['wer_reference_units']} | {accuracy['wer_definition']}")
+    print(
+        f"端到端可用率: {accuracy['usable_transcript_count']}/{accuracy['accuracy_attempts']} ({accuracy['usable_transcript_rate']:.2f}%，分母含请求失败) | 成功样本内 {accuracy['conditional_usable_transcript_rate']:.2f}% | 未评分/失败 {accuracy['accuracy_failed_requests']}")
 
 
 def run_accuracy_self_test():
@@ -3478,8 +3555,8 @@ def get_audio_duration(audio_file):
                 if sample_rate > 0:
                     duration = wav_file.getnframes() / float(sample_rate)
                     if (
-                        math.isfinite(duration)
-                        and 0 < duration <= MAX_REASONABLE_AUDIO_SECONDS
+                            math.isfinite(duration)
+                            and 0 < duration <= MAX_REASONABLE_AUDIO_SECONDS
                     ):
                         return duration
         except (OSError, EOFError, wave.Error):
@@ -3518,10 +3595,9 @@ def get_audio_duration(audio_file):
         {},
     )
     return (
-        _reasonable_audio_duration(audio_stream.get("duration"))
-        or _reasonable_audio_duration(probe.get("format", {}).get("duration"))
+            _reasonable_audio_duration(audio_stream.get("duration"))
+            or _reasonable_audio_duration(probe.get("format", {}).get("duration"))
     )
-
 
 
 def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -3544,7 +3620,7 @@ def _reject_json_constant(value: str) -> Any:
 
 def _validate_json_complexity(body: Any) -> None:
     """Validate JSON response complexity without cycle detection.
-    
+
     JSON deserialization cannot produce cyclic structures, so we only check
     depth and node count. The 'seen' set is removed as it would cause false
     positives if the same dict/list object appears multiple times in traversal
@@ -3579,12 +3655,14 @@ def extract_asr_text(body, *, _depth=0, event_text_mode=None):
     if _depth > MAX_RESPONSE_NESTING:
         raise ValueError("ASR text nesting limit exceeded")
     if isinstance(body, dict):
-        if "parse_error" in body or str(body.get("type", "")).lower() in {"ack", "ready", "started", "configured", "end", "ended"}:
+        if "parse_error" in body or str(body.get("type", "")).lower() in {"ack", "ready", "started", "configured",
+                                                                          "end", "ended"}:
             return False, ""
         for key in ("text", "content", "answer", "result", "transcript", "transcription", "recognized_text"):
             if isinstance(body.get(key), str):
                 return True, body[key]
-        for key in ("result", "data", "results", "output", "response", "payload", "choices", "delta", "segments", "sentence_info"):
+        for key in ("result", "data", "results", "output", "response", "payload", "choices", "delta", "segments",
+                    "sentence_info"):
             value = body.get(key)
             if key in {"segments", "sentence_info"} and isinstance(value, list):
                 parts = [extract_asr_text(x, _depth=_depth + 1, event_text_mode=mode) for x in value]
@@ -3692,16 +3770,18 @@ def parse_response_body(response_body, content_type="", encoding=None):
         text = response_body.decode(encoding or "utf-8-sig", errors="strict").lstrip("\ufeff").strip()
         if not text or text == "[DONE]":
             return {}
+
         def load(payload):
             value = _load_json_strict(payload)
             _validate_json_complexity(value)
             if not isinstance(value, (dict, list)):
                 raise ValueError("ASR JSON must be object or array")
             return value
+
         media_type = content_type.partition(";")[0].strip().lower()
         is_sse = media_type == "text/event-stream" or (
-            media_type not in {"application/json", "text/json"} and not media_type.endswith("+json")
-            and text.startswith(("data:", "event:", ":")))
+                media_type not in {"application/json", "text/json"} and not media_type.endswith("+json")
+                and text.startswith(("data:", "event:", ":")))
         if not is_sse:
             try:
                 return load(text)
@@ -3719,6 +3799,7 @@ def parse_response_body(response_body, content_type="", encoding=None):
                 return result
         events, data = [], []
         done = False
+
         def flush():
             nonlocal done
             payload = "\n".join(data).strip()
@@ -3731,6 +3812,7 @@ def parse_response_body(response_body, content_type="", encoding=None):
                 done = True
             else:
                 events.append(load(payload))
+
         for line in text.splitlines():
             if not line.strip():
                 flush()
@@ -3810,7 +3892,7 @@ def build_performance_summary(metrics):
     if response_header_times:
         summary.update({
             "avg_time_to_response_headers_sec": (
-                math.fsum(response_header_times) / len(response_header_times)
+                    math.fsum(response_header_times) / len(response_header_times)
             ),
             "p95_time_to_response_headers_sec": percentile(response_header_times, 95),
         })
@@ -3818,7 +3900,7 @@ def build_performance_summary(metrics):
     if first_body_byte_times:
         summary.update({
             "avg_time_to_first_body_byte_sec": (
-                math.fsum(first_body_byte_times) / len(first_body_byte_times)
+                    math.fsum(first_body_byte_times) / len(first_body_byte_times)
             ),
             "p95_time_to_first_body_byte_sec": percentile(first_body_byte_times, 95),
         })
@@ -3896,8 +3978,8 @@ def print_performance_metrics(metrics):
         print("收到响应体首字节耗时: 无样本 (0.0%)")
 
     if (
-        summary["attempt_count"] < 20
-        or 0 < summary["success_count"] < 20
+            summary["attempt_count"] < 20
+            or 0 < summary["success_count"] < 20
     ):
         print(
             "样本提示: "
@@ -3985,8 +4067,8 @@ async def _asr_via_websocket_async(
     try:
         async with asyncio.timeout(timeout):
             async with websockets.connect(ASR_STREAM_WS_URL, open_timeout=timeout,
-                                           close_timeout=min(timeout, 1.0),
-                                           max_size=32 * 1024 * 1024) as ws:
+                                          close_timeout=min(timeout, 1.0),
+                                          max_size=32 * 1024 * 1024) as ws:
                 connected = time.perf_counter() - started
                 await ws.send(json.dumps(ASR_STREAM_CONFIG, ensure_ascii=False))
                 confirmation = await ws.recv()
@@ -4275,7 +4357,8 @@ def run_multiple_files(
     if reference_file is not None or reference_text is not None:
         hashes = {sha256_file(path) for path in audio_files if Path(path).is_file()}
         if len(hashes) > 1:
-            raise ValueError("one shared reference may only evaluate repeated identical audio; use per-audio references")
+            raise ValueError(
+                "one shared reference may only evaluate repeated identical audio; use per-audio references")
     results = []
     request_metrics = []
     all_outcomes = []
@@ -4377,7 +4460,10 @@ def legacy_main(argv=None):
     )
     parser.add_argument(
         "--insecure", action=argparse.BooleanOptionalAction,
-        default=not ASR_VERIFY_TLS if os.getenv("ASR_GATEWAY_INSECURE", "").lower() not in {"1", "true", "yes", "0", "false", "no"} else os.getenv("ASR_GATEWAY_INSECURE", "").lower() in {"1", "true", "yes"},
+        default=not ASR_VERIFY_TLS if os.getenv("ASR_GATEWAY_INSECURE", "").lower() not in {"1", "true", "yes", "0",
+                                                                                            "false",
+                                                                                            "no"} else os.getenv(
+            "ASR_GATEWAY_INSECURE", "").lower() in {"1", "true", "yes"},
         help="禁用 TLS 证书校验；仅限受信内网临时测试，也可用 ASR_GATEWAY_INSECURE=1 或修改代码中的 ASR_VERIFY_TLS",
     )
     args = parser.parse_args(argv)
